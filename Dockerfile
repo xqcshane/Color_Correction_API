@@ -15,7 +15,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # Use authenticated Ubuntu mirrors and avoid stale proxy indexes during mirror sync.
 # Keep by-hash optional for third-party repositories that do not support it.
-RUN find /etc/apt -maxdepth 2 -type f \( -name '*.list' -o -name '*.sources' \) \
+RUN mkdir -p /data/tmp /data/cupy-cache \
+    && find /etc/apt -maxdepth 2 -type f \( -name '*.list' -o -name '*.sources' \) \
       -exec sed -i \
         -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
         -e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' {} + \
@@ -42,7 +43,6 @@ COPY api /app/api
 COPY scripts /app/scripts
 RUN groupadd --gid 10001 colorapi \
     && useradd --uid 10001 --gid colorapi --no-create-home colorapi \
-    && mkdir -p /data/tmp /data/cupy-cache \
     && chown -R colorapi:colorapi /data
 
 USER colorapi
