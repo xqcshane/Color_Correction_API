@@ -124,7 +124,7 @@ class JobLease:
 
 
 class UploadLease:
-    """Cover multipart spooling and inspection before a GPU job is submitted."""
+    """Cover multipart spooling and inspection before a job is submitted."""
 
     def __init__(self, manager: "JobManager"):
         self._manager = manager
@@ -165,6 +165,7 @@ class JobManager:
         self._executor = ThreadPoolExecutor(
             max_workers=max(1, worker_count), thread_name_prefix="cmyk-job"
         )
+        self._tools_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cmyk-tools")
         if retention_hours is None:
             try:
                 retention_hours = float(os.getenv("CMYK_API_JOB_TTL_HOURS", "24"))
@@ -202,7 +203,10 @@ class JobManager:
         self._write_manifest(record)
         return record
 
-    def submit(self, job_id: str, processor: Processor) -> Future[None] | None:
+    def submit(self, job_id: str, processor: Processor, *, pool: str = "gpu") -> Future[None] | None:
+        if pool not in {"gpu", "tools"}:
+            raise ValueError("pool 必须是 gpu 或 tools")
+        executor = self._executor if pool == "gpu" else self._tools_executor
         with self._lock:
             record = self.require(job_id)
             if record.cancel_event.is_set():
@@ -217,7 +221,7 @@ class JobManager:
             record.stage = "排队中"
             record.updated_at = utc_now()
             self._write_manifest(record)
-            self._futures[job_id] = self._executor.submit(
+            self._futures[job_id] = executor.submit(
                 self._run, record, processor
             )
             return self._futures[job_id]
@@ -244,13 +248,19 @@ class JobManager:
             if produced is not None and produced.resolve() != record.result_pdf.resolve():
                 shutil.move(str(produced), str(record.result_pdf))
             if not record.result_pdf.is_file():
-                raise RuntimeError("处理器没有生成 result.pdf")
+                raise RuntimeError(f"处理器没有生成 {record.result_pdf.name}")
             with self._lock:
+                # cancel() uses the same lock. Honor cancellation received
+                # during final file I/O before committing successful status.
+                context.check_cancelled()
                 record.result_bytes = record.result_pdf.stat().st_size
                 record.progress = 1.0
                 record.status = "succeeded"
                 record.stage = "已完成"
-                record.message = "PDF 已生成，可以下载。"
+                suffix = record.result_pdf.suffix.lower()
+                record.message = ("PDF 已生成，可以下载。" if suffix == ".pdf" else
+                                  "图片已生成，可以下载。" if suffix in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp"}
+                                  else "结果文件已生成，可以下载。")
                 record.updated_at = utc_now()
                 self._mark_finished(record)
                 self._purge_record_files(record)
@@ -364,6 +374,7 @@ class JobManager:
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
+        self._tools_executor.shutdown(wait=False, cancel_futures=True)
 
     def cleanup_expired(self) -> int:
         """Delete finished jobs after their download-retention window.
@@ -457,7 +468,7 @@ class JobManager:
                     path.unlink(missing_ok=True)
                 removed += 1
             except OSError:
-                # A locked file must not discard a good PDF. The periodic pass
+                # A locked file must not discard a good result. The periodic pass
                 # retries it after the worker and any decoders have released it.
                 _LOG.warning("Unable to remove job artifact %s", path, exc_info=True)
         return removed
@@ -486,7 +497,7 @@ class JobManager:
         temp_files = temp_dirs = 0
         if cache_dir is not None or temp_dir is not None:
             # Hold the scheduling lock while deleting old compiled cache files.
-            # A new GPU job cannot enter the queue between this idle check and
+            # A new GPU/CPU job cannot enter a queue between this idle check and
             # removal. Uploads also count as active to avoid competing with I/O.
             with self._lock:
                 idle = self._active_upload_leases == 0
@@ -518,7 +529,7 @@ class JobManager:
 
     @staticmethod
     def _find_result_file(directory: Path) -> Path:
-        preferred = ("result.pdf", "result.tif", "result.tiff")
+        preferred = ("result.pdf", "result.png", "result.tif", "result.tiff")
         for name in preferred:
             candidate = directory / name
             if candidate.is_file():
@@ -534,7 +545,7 @@ class JobManager:
     def _restore_and_cleanup(self) -> None:
         """Restore downloadable results and discard expired orphan directories.
 
-        A process restart cannot resume an in-flight GPU task.  Such manifests
+        A process restart cannot resume an in-flight task.  Such manifests
         are converted to a terminal failed state, making them safe for normal
         TTL cleanup and explicit deletion through the API.
         """

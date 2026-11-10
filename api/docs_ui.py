@@ -11,11 +11,12 @@ from fastapi.responses import HTMLResponse
 
 _INTERCEPTOR_JS = """requestInterceptor: function preserveMultipartJson(request) {
       const path = new URL(request.url, location.href).pathname
-        .match(/(\\/api\\/(?:nearest|predict))\\/?$/)?.[1];
+        .match(/(\\/api\\/(?:nearest|predict|tools\\/place-image))\\/?$/)?.[1];
       if (path && request.body instanceof FormData) {
+        const field = path === "/api/tools/place-image" ? "layer_name" : "layers";
         const raw = ui.getSystem().oas3Selectors
-          .requestBodyValue(path, "post")?.getIn(["layers", "value"]);
-        if (typeof raw === "string") request.body.set("layers", raw);
+          .requestBodyValue(path, "post")?.getIn([field, "value"]);
+        if (typeof raw === "string") request.body.set(field, raw);
         const dpi = request.body.get("dpi");
         if (typeof dpi === "string" && !dpi.trim()) request.body.delete("dpi");
       }

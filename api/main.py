@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import mimetypes
 import os
 import re
 import threading
@@ -12,7 +13,9 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exception_handlers import http_exception_handler
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -27,20 +30,24 @@ from .jobs import JobManager, JobRecord
 from .lifecycle import LeasedFileResponse, maintenance_loop, upload_temporary_directory
 from .pdf_engine import inspect_pdf
 from .processor import process_job
+from .tools_routes import create_tools_router
 
 
 class BodyLimitMiddleware:
     """Count bytes before multipart parsing, including chunked uploads."""
-    def __init__(self, app, max_bytes: int):
+    def __init__(self, app, max_bytes: int, path_limits: dict[str, int] | None = None):
         self.app, self.max_bytes = app, max_bytes
+        self.path_limits = path_limits or {}
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
+        path = scope.get("path", "").removeprefix(scope.get("root_path", "")).rstrip("/")
+        limit = self.path_limits.get(path, self.max_bytes)
         length = dict(scope.get("headers", [])).get(b"content-length")
         if length:
             try:
-                oversized = int(length) > self.max_bytes
+                oversized = int(length) > limit
             except ValueError:
                 oversized = True
             if oversized:
@@ -51,7 +58,7 @@ class BodyLimitMiddleware:
             nonlocal total
             message = await receive()
             total += len(message.get("body", b""))
-            if total > self.max_bytes:
+            if total > limit:
                 scope["upload_limit_exceeded"] = True
                 # MultipartParser closes all spooled temporary files for this
                 # exception, including files uploaded before the limit is hit.
@@ -128,12 +135,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                   openapi_tags=[
                       {"name": "GPU 找最接近", "description": "按实测色块匹配 CMYK，输入 PDF、CSV、图层名及可选 DPI，输出 PDF。"},
                       {"name": "GPU 推算新色", "description": "根据 CMYK–Lab 数据推算新配方，输入 PDF、CSV、图层名及可选 DPI，输出 PDF。"},
+                      {"name": "PDF 与二维码工具", "description": "按毫米坐标将图片放入独立 PDF 图层，或将链接转为透明 PNG 二维码；工具任务使用独立 CPU 队列。"},
                       {"name": "服务状态", "description": "服务健康、GPU 就绪状态与处理能力。"},
                       {"name": "任务管理", "description": "查询进度、下载结果、取消或删除异步任务。"},
                   ])
     app.state.settings, app.state.jobs = settings, jobs
     app.add_middleware(BodyLimitMiddleware,
-                       max_bytes=settings.max_upload_bytes + settings.max_csv_bytes + 1024**2)
+                       max_bytes=settings.max_upload_bytes + settings.max_csv_bytes + 1024**2,
+                       path_limits={
+                           "/api/tools/place-image": settings.max_upload_bytes + settings.max_image_bytes + 1024**2,
+                           "/api/tools/qrcode": 32 * 1024,
+                       })
 
     @app.get("/docs", include_in_schema=False)
     def docs(request: Request):
@@ -146,6 +158,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if request.scope.get("upload_limit_exceeded"):
             return JSONResponse({"detail": "上传请求超过配置大小上限"}, status_code=413)
         return await http_exception_handler(request, exc)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request, exc):
+        # Escape lone surrogates in invalid JSON inputs so a validation error
+        # remains HTTP 422 instead of failing during UTF-8 response encoding.
+        content = {"detail": jsonable_encoder(exc.errors())}
+        return Response(json.dumps(content, ensure_ascii=True), status_code=422,
+                        media_type="application/json")
 
     def compute():
         return getattr(app.state, "compute", None) or detect_capabilities(settings.force_cpu)
@@ -172,10 +192,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             if record.status != "succeeded" or not record.result_pdf.is_file():
                 raise HTTPException(409, {"status": record.status, "error": record.error})
+            suffix = record.result_pdf.suffix.lower()
+            method = str(record.options.get("method") or "processed")
             stem = re.sub(r"[^A-Za-z0-9._\-\u4e00-\u9fff]+", "_", Path(record.original_filename).stem)[:120] or "result"
-            return LeasedFileResponse(record.result_pdf, media_type="application/pdf",
-                                      filename=f"{stem}-{record.options.get('method', 'processed')}-CMYK.pdf",
-                                      headers={"X-Job-ID": record.id}, lease=lease)
+            if method in {"nearest", "model"}:
+                filename = f"{stem}-{method}-CMYK{suffix}"
+            elif method == "qrcode":
+                filename = "qrcode.png"
+            else:
+                filename = f"{stem}-{method}{suffix}"
+            media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            return LeasedFileResponse(record.result_pdf, media_type=media_type,
+                                      filename=filename, headers={"X-Job-ID": record.id}, lease=lease)
         except BaseException:
             lease.release()
             raise
@@ -200,10 +228,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             "cleanupIntervalSeconds": settings.cleanup_interval_seconds},
                 "limits": {"maxUploadBytes": settings.max_upload_bytes,
                            "maxCsvBytes": settings.max_csv_bytes,
+                           "maxImageBytes": settings.max_image_bytes,
+                           "maxImagePixels": settings.max_image_pixels,
                            "maxPendingJobs": settings.max_pending_jobs,
                            "workerCount": 1},
                 "features": {"asyncJobs": True, "largeFileDiskSpooling": True,
-                             "nativeImagePixelDensityPreserved": True}}
+                             "nativeImagePixelDensityPreserved": True,
+                             "independentImageLayer": True, "transparentQrCode": True}}
 
     multipart_schema = {"requestBody": {"required": True, "content": {"multipart/form-data": {
         "schema": {"type": "object", "required": ["pdf", "csv", "layers"], "properties": {
@@ -319,6 +350,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(409, str(exc)) from exc
         return {"deleted": True}
 
+    app.include_router(create_tools_router(settings=settings, jobs=jobs, slots=slots,
+                                          save_upload=_save_upload, result_response=result_response))
     return app
 
 

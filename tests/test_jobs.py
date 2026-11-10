@@ -4,6 +4,7 @@ from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
+import os
 import threading
 
 from fastapi.testclient import TestClient
@@ -133,7 +134,8 @@ def test_cleanup_and_delete_wait_until_future_is_fully_done(tmp_path):
         manager.shutdown()
 
 
-def test_cancelled_queued_future_never_recreates_deleted_directory(tmp_path):
+@pytest.mark.parametrize("pool", ["gpu", "tools"])
+def test_cancelled_queued_future_never_recreates_deleted_directory(tmp_path, pool):
     manager = JobManager(tmp_path)
     started, release = threading.Event(), threading.Event()
     blocker = manager.reserve(original_filename="active.pdf", options={}, has_pairs=False)
@@ -144,17 +146,20 @@ def test_cancelled_queued_future_never_recreates_deleted_directory(tmp_path):
         context.record.result_pdf.write_bytes(b"done")
         return context.record.result_pdf
 
-    first_future = manager.submit(blocker.id, blocking)
+    first_future = manager.submit(blocker.id, blocking, pool=pool)
     try:
         assert started.wait(2)
         queued = manager.reserve(original_filename="queued.pdf", options={}, has_pairs=False)
+        queued.input_pdf.write_bytes(b"queued upload")
         called = threading.Event()
 
         def should_never_run(context):
             called.set()
             raise AssertionError("cancelled queued task executed")
 
-        queued_future = manager.submit(queued.id, should_never_run)
+        queued_future = manager.submit(queued.id, should_never_run, pool=pool)
+        assert manager.maintenance()["removed_artifacts"] == 0
+        assert queued.input_pdf.read_bytes() == b"queued upload"
         assert manager.cancel(queued.id).status == "cancelled"
         assert queued_future.cancelled()
         manager.delete(queued.id)
@@ -164,6 +169,265 @@ def test_cancelled_queued_future_never_recreates_deleted_directory(tmp_path):
         assert not queued.directory.exists()
     finally:
         release.set()
+        manager.shutdown()
+
+
+def test_cpu_tool_finishes_while_gpu_queue_is_blocked(tmp_path):
+    manager = JobManager(tmp_path)
+    started, release = threading.Event(), threading.Event()
+    gpu = manager.reserve(original_filename="gpu.pdf", options={}, has_pairs=False)
+    tool = manager.reserve(original_filename="code.png", options={"method": "qr"}, has_pairs=False)
+    manager.update(tool.id, result_pdf=tool.directory / "result.png")
+
+    def blocking_gpu(context):
+        started.set()
+        assert release.wait(5)
+        context.record.result_pdf.write_bytes(b"GPU PDF")
+        return context.record.result_pdf
+
+    def cpu_tool(context):
+        context.record.result_pdf.write_bytes(b"\x89PNG\r\nCPU result")
+        return context.record.result_pdf
+
+    gpu_future = manager.submit(gpu.id, blocking_gpu)
+    try:
+        assert started.wait(2)
+        tool_future = manager.submit(tool.id, cpu_tool, pool="tools")
+        tool_future.result(timeout=2)
+        assert tool.status == "succeeded"
+        assert "图片" in tool.message
+        assert manager._futures[tool.id] is tool_future
+        assert not gpu_future.done()
+        assert tool.result_pdf.read_bytes() == b"\x89PNG\r\nCPU result"
+    finally:
+        release.set()
+        gpu_future.result(timeout=3)
+        manager.shutdown()
+
+
+def test_unknown_worker_pool_is_rejected_without_changing_job(tmp_path):
+    manager = JobManager(tmp_path)
+    record = manager.reserve(original_filename="unknown.pdf", options={}, has_pairs=False)
+    called = threading.Event()
+    try:
+        with pytest.raises(ValueError, match="gpu 或 tools"):
+            manager.submit(record.id, lambda _: called.set(), pool="unknown")
+        assert record.status == "uploading"
+        assert record.id not in manager._futures
+        assert not called.is_set()
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("pool,suffix", [("gpu", ".pdf"), ("tools", ".png")])
+def test_cancel_during_final_file_check_wins_before_success_commit(tmp_path, monkeypatch, pool, suffix):
+    manager = JobManager(tmp_path)
+    record = manager.reserve(original_filename=f"source{suffix}", options={}, has_pairs=False)
+    manager.update(record.id, result_pdf=record.directory / f"result{suffix}")
+    record.input_pdf.write_bytes(b"active input")
+    checked, release = threading.Event(), threading.Event()
+    original_is_file = Path.is_file
+
+    def pause_final_check(path):
+        if path == record.result_pdf and not checked.is_set():
+            checked.set()
+            assert release.wait(5)
+        return original_is_file(path)
+
+    def process(context):
+        context.record.result_pdf.write_bytes(b"completed processing")
+        return context.record.result_pdf
+
+    monkeypatch.setattr(Path, "is_file", pause_final_check)
+    future = manager.submit(record.id, process, pool=pool)
+    try:
+        assert checked.wait(2)
+        # Processing and the lock-free cancellation check have finished, but
+        # the worker has not yet committed its terminal status.
+        assert manager.cancel(record.id).status == "running"
+        assert record.cancel_event.is_set()
+        release.set()
+        future.result(timeout=3)
+        assert record.status == "cancelled"
+        assert record.finished_at is not None
+        assert not record.result_pdf.exists()
+        assert not record.input_pdf.exists()
+        manifest = json.loads((record.directory / "job.json").read_text(encoding="utf-8"))
+        assert manifest["status"] == "cancelled"
+        assert manifest["result_url"] is None
+    finally:
+        release.set()
+        future.result(timeout=3)
+        manager.shutdown()
+
+
+def test_png_success_cleanup_pin_and_expiry_use_same_24_hour_lifecycle(tmp_path):
+    manager = JobManager(tmp_path, retention_hours=24)
+    record = manager.reserve(original_filename="link.png", options={"method": "qr"}, has_pairs=True)
+    manager.update(record.id, result_pdf=record.directory / "result.png")
+    record.input_pdf.write_bytes(b"uploaded image")
+    record.pairs_file.write_bytes(b"unused source")
+    expected = b"\x89PNG\r\nretained result"
+
+    def process(context):
+        context.record.result_pdf.write_bytes(expected)
+        (context.record.directory / "result.json").write_text('{"kind":"png"}', encoding="utf-8")
+        (context.record.directory / "intermediate.tmp").write_bytes(b"temporary")
+        return context.record.result_pdf
+
+    lease = None
+    try:
+        manager.submit(record.id, process, pool="tools").result(timeout=3)
+        assert {path.name for path in record.directory.iterdir()} == {"job.json", "result.json", "result.png"}
+        record.finished_at = (datetime.now(timezone.utc) - timedelta(hours=23)).isoformat()
+        assert manager.cleanup_expired() == 0
+        lease = manager.pin(record.id)
+        record.finished_at = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+        finished_at = record.finished_at
+        manager.update(record.id, message="download does not extend retention")
+        assert record.finished_at == finished_at
+        assert manager.cleanup_expired() == 0
+        assert lease.record.result_pdf.read_bytes() == expected
+        with pytest.raises(RuntimeError, match="下载"):
+            manager.delete(record.id)
+        with pytest.raises(KeyError, match="保留期"):
+            manager.pin(record.id)
+        lease.release()
+        assert manager.cleanup_expired() == 1
+        assert not record.directory.exists()
+    finally:
+        if lease is not None:
+            lease.release()
+        manager.shutdown()
+
+
+def test_completed_png_is_restored_with_download_lease_after_restart(tmp_path):
+    manager = JobManager(tmp_path)
+    record = manager.reserve(original_filename="link.png", options={"method": "qr"}, has_pairs=False)
+    manager.update(record.id, result_pdf=record.directory / "result.png")
+    expected = b"\x89PNG\r\nrestart result"
+
+    def process(context):
+        context.record.result_pdf.write_bytes(expected)
+        return context.record.result_pdf
+
+    try:
+        manager.submit(record.id, process, pool="tools").result(timeout=3)
+        finished_at = record.finished_at
+    finally:
+        manager.shutdown()
+    restored = JobManager(tmp_path)
+    try:
+        recovered = restored.require(record.id)
+        assert recovered.status == "succeeded"
+        assert recovered.result_pdf.name == "result.png"
+        assert recovered.finished_at == finished_at
+        assert recovered.options["method"] == "qr"
+        with restored.pin(record.id) as pinned:
+            assert pinned.result_pdf.read_bytes() == expected
+            assert pinned.public_dict()["result_url"] == f"/api/jobs/{record.id}/result"
+            assert restored.cleanup_terminal_files() == 0
+        assert recovered.result_pdf.is_file()
+    finally:
+        restored.shutdown()
+
+
+@pytest.mark.parametrize("suffix,label", [(".pdf", "PDF"), (".png", "图片"), (".zip", "结果文件")])
+def test_result_message_matches_output_type(tmp_path, suffix, label):
+    manager = JobManager(tmp_path)
+    record = manager.reserve(original_filename="source", options={}, has_pairs=False)
+    manager.update(record.id, result_pdf=record.directory / f"result{suffix}")
+
+    def process(context):
+        context.record.result_pdf.write_bytes(b"result")
+        return context.record.result_pdf
+
+    try:
+        manager.submit(record.id, process, pool="tools").result(timeout=3)
+        assert record.status == "succeeded"
+        assert record.message.startswith(label)
+        assert record.result_pdf.read_bytes() == b"result"
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("status", ["running", "cancelled"])
+def test_live_cpu_future_prevents_idle_cache_and_input_cleanup(tmp_path, status):
+    manager = JobManager(tmp_path)
+    record = manager.reserve(original_filename="cpu.png", options={}, has_pairs=False)
+    manager.update(record.id, result_pdf=record.directory / "result.png")
+    record.input_pdf.write_bytes(b"active input")
+    cache = tmp_path / "cupy-cache" / "old.cubin"
+    spool = tmp_path / "tmp" / "old-spool.tmp"
+    old = (datetime.now(timezone.utc) - timedelta(hours=25)).timestamp()
+    for path in (cache, spool):
+        path.parent.mkdir()
+        path.write_bytes(b"old cache")
+        os.utime(path, (old, old))
+    started, release = threading.Event(), threading.Event()
+
+    def process(context):
+        started.set()
+        assert release.wait(5)
+        context.record.result_pdf.write_bytes(b"PNG result")
+        return context.record.result_pdf
+
+    future = manager.submit(record.id, process, pool="tools")
+    try:
+        assert started.wait(2)
+        # Even a terminal status must not make a still-running future idle.
+        if status == "cancelled":
+            manager.update(record.id, status="cancelled")
+        result = manager.maintenance(cache_dir=cache.parent, temp_dir=spool.parent)
+        assert result["removed_cache_files"] == result["removed_temp_files"] == 0
+        assert cache.exists() and spool.exists()
+        assert record.input_pdf.read_bytes() == b"active input"
+        release.set()
+        future.result(timeout=3)
+        result = manager.maintenance(cache_dir=cache.parent, temp_dir=spool.parent)
+        assert result["removed_cache_files"] == result["removed_temp_files"] == 1
+        assert record.result_pdf.is_file()
+    finally:
+        release.set()
+        future.result(timeout=3)
+        manager.shutdown()
+
+
+def test_shutdown_cancels_queued_tasks_in_both_worker_pools(tmp_path):
+    manager = JobManager(tmp_path)
+    release = threading.Event()
+    running = []
+    queued = []
+    called = threading.Event()
+
+    def never_run(_context):
+        called.set()
+
+    try:
+        for pool in ("gpu", "tools"):
+            started = threading.Event()
+
+            def block(context, started=started):
+                started.set()
+                assert release.wait(5)
+                context.record.result_pdf.write_bytes(b"result")
+                return context.record.result_pdf
+
+            first = manager.reserve(original_filename=f"{pool}.pdf", options={}, has_pairs=False)
+            running.append(manager.submit(first.id, block, pool=pool))
+            assert started.wait(2)
+            second = manager.reserve(original_filename=f"{pool}-queued.pdf", options={}, has_pairs=False)
+            queued.append(manager.submit(second.id, never_run, pool=pool))
+        manager.shutdown()
+        assert all(future.cancelled() for future in queued)
+        release.set()
+        for future in running:
+            future.result(timeout=3)
+        assert not called.is_set()
+    finally:
+        release.set()
+        for future in running:
+            future.result(timeout=3)
         manager.shutdown()
 
 

@@ -54,7 +54,7 @@ jobs:
           docker run -d --name color-api-ci -e CMYK_API_FORCE_CPU=true
           --mount "type=bind,source=$(pwd)/output,target=/data"
           color-correction-api:ci
-      - name: Exercise both PDF APIs inside the built container
+      - name: Exercise color and PDF/QR tool APIs inside the built container
         run: docker exec color-api-ci python /app/scripts/smoke_test.py
       - name: Container logs
         if: always()

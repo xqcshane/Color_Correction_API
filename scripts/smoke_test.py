@@ -59,24 +59,26 @@ def make_pdf():
         return document.tobytes(), preserved_stream
 
 
-def multipart(pdf: bytes, csv: bytes, dpi: int | None):
+def form_data(files, fields):
     boundary = "colorapi-" + uuid.uuid4().hex
     parts = []
-    for name, filename, content_type, content in (
-        ("pdf", "design.pdf", "application/pdf", pdf),
-        ("csv", "measurements.csv", "text/csv", csv),
-    ):
+    for name, filename, content_type, content in files:
         parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; '
                       f'filename="{filename}"\r\nContent-Type: {content_type}\r\n\r\n').encode())
         parts.extend((content, b"\r\n"))
-    fields = {"layers": '["Artwork"]'}
-    if dpi is not None:
-        fields["dpi"] = str(dpi)
     for name, value in fields.items():
         parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"'
                       f'\r\n\r\n{value}\r\n').encode())
     parts.append(f"--{boundary}--\r\n".encode())
     return b"".join(parts), {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+
+
+def multipart(pdf: bytes, csv: bytes, dpi: int | None):
+    fields = {"layers": '["Artwork"]'}
+    if dpi is not None:
+        fields["dpi"] = str(dpi)
+    return form_data((("pdf", "design.pdf", "application/pdf", pdf),
+                      ("csv", "measurements.csv", "text/csv", csv)), fields)
 
 
 def main() -> None:
@@ -112,6 +114,38 @@ def main() -> None:
         assert job["result"]["info"]["quality"] == "fine", job
         request(f"/api/jobs/{job_id}", method="DELETE")
         print(f"PASS /api/{endpoint}: PDF with CMYK image {dimensions}, preserved Technical layer", flush=True)
+
+
+    # Test the CPU utilities in the same packaged image, including persistent
+    # PNG retrieval and placing that transparent image into a fresh OCG.
+    from io import BytesIO
+    from PIL import Image
+    status, qr_headers, qr_png = request("/api/tools/qrcode",
+        data=json.dumps({"url": "https://example.com/demo?color=cyan"}).encode(),
+        headers={"Content-Type": "application/json"})
+    assert status == 200 and qr_headers.get_content_type() == "image/png"
+    with Image.open(BytesIO(qr_png)) as qr_image:
+        rgba = qr_image.convert("RGBA")
+        assert rgba.getpixel((0, 0))[3] == 0
+        assert rgba.getchannel("A").getextrema() == (0, 255)
+    qr_id = qr_headers["X-Job-ID"]
+    _, saved_qr_headers, saved_qr = request(f"/api/jobs/{qr_id}/result")
+    assert saved_qr_headers.get_content_type() == "image/png" and saved_qr == qr_png
+    print("PASS /api/tools/qrcode: transparent PNG persisted and downloaded", flush=True)
+    body, headers = form_data((("pdf", "design.pdf", "application/pdf", pdf),
+                               ("image", "qrcode.png", "image/png", qr_png)),
+        {"page": "1", "x_mm": "5", "y_mm": "5", "width_mm": "30", "height_mm": "30", "layer_name": "Artwork"})
+    status, placed_headers, placed_pdf = request("/api/tools/place-image", data=body, headers=headers)
+    assert status == 200 and placed_headers.get_content_type() == "application/pdf"
+    with pymupdf.open(stream=placed_pdf, filetype="pdf") as result:
+        assert tuple(result[0].rect) == (0, 0, 240, 120)
+        assert sum(layer["name"] == "Artwork" for layer in result.get_ocgs().values()) == 2
+        assert preserved_stream in [result.xref_stream(ref) for ref in result[0].get_contents()]
+        assert any(image["width"] == 120 and image["height"] == 60 and image["colorspace"] == 3
+                   for image in result[0].get_image_info()), "Original RGB pixels were changed"
+    request(f"/api/jobs/{placed_headers['X-Job-ID']}", method="DELETE")
+    request(f"/api/jobs/{qr_id}", method="DELETE")
+    print("PASS /api/tools/place-image: fresh same-named layer, original pixels and Technical stream retained", flush=True)
 
 
 if __name__ == "__main__":

@@ -174,10 +174,10 @@ let config, rawLayers, stateCalls = 0;
 const SwaggerUIBundle = options => {
   config = options;
   return {getSystem: () => ({oas3Selectors: {requestBodyValue: (path, method) => {
-    assert.ok(['/api/nearest', '/api/predict'].includes(path));
+    assert.ok(['/api/nearest', '/api/predict', '/api/tools/place-image'].includes(path));
     assert.equal(method, 'post');
     stateCalls++;
-    return {getIn: keys => {assert.deepEqual(keys, ['layers', 'value']); return rawLayers;}};
+    return {getIn: keys => {assert.deepEqual(keys, [path === '/api/tools/place-image' ? 'layer_name' : 'layers', 'value']); return rawLayers;}};
   }}})};
 };
 SwaggerUIBundle.presets = {apis: {}};
@@ -205,6 +205,16 @@ for (const path of ['/api/nearest', '/api/predict']) {
     config.requestInterceptor(request);
     assert.equal(body.get('dpi'), '72');
   }
+}
+for (const raw of ['QR_Code', '["QR","Label"]', '中文独立层']) {
+  rawLayers = raw;
+  const body = new FormData();
+  body.append('pdf', new Blob(['pdf']), 'source.pdf');
+  body.append('image', new Blob(['png']), 'image.png');
+  body.append('layer_name', 'serialized-wrongly');
+  config.requestInterceptor({url: 'http://localhost/api/tools/place-image', body});
+  assert.equal(body.get('layer_name'), raw);
+  assert.equal([...body.values()].filter(value => typeof value !== 'string').length, 2);
 }
 const callsBefore = stateCalls;
 const otherBody = new FormData(); otherBody.append('layers', 'unchanged'); otherBody.append('dpi', '');
@@ -397,4 +407,4 @@ def test_swagger_tags_separate_both_algorithms_and_utility_endpoints(client):
     assert schema["paths"]["/api/predict"]["post"]["tags"] == ["GPU 推算新色"]
     assert schema["paths"]["/api/health"]["get"]["tags"] == ["服务状态"]
     assert schema["paths"]["/api/jobs/{job_id}"]["get"]["tags"] == ["任务管理"]
-    assert {tag["name"] for tag in schema["tags"]} == {"GPU 找最接近", "GPU 推算新色", "服务状态", "任务管理"}
+    assert {tag["name"] for tag in schema["tags"]} == {"GPU 找最接近", "GPU 推算新色", "PDF 与二维码工具", "服务状态", "任务管理"}

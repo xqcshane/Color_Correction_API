@@ -1,6 +1,6 @@
 # Color Correction API
 
-从 CMYK Recipe Studio 提取的独立 PDF 颜色校正服务。提供两个 GPU 接口，输入 PDF、CMYK–Lab CSV、需要处理的图层名称和可选输出 DPI，输出 PDF。默认使用精细算法和原稿密度，不生成布料/设备右下角标注。仓库另附独立运行的本地测试网页。
+从 CMYK Recipe Studio 提取的独立 PDF 颜色校正服务。提供两个 GPU 接口，输入 PDF、CMYK–Lab CSV、需要处理的图层名称和可选输出 DPI，输出 PDF；另有独立图层放图和透明 PNG 二维码工具。颜色计算默认使用精细算法和原稿密度，不生成布料/设备右下角标注。仓库另附独立运行的本地测试网页。
 
 ## 部署（Linux + RTX 3090）
 
@@ -114,6 +114,50 @@ curl --fail-with-body --max-time 0 \
 
 同一个嵌入图像对象若在多个不同物理尺寸下复用，无法同时让所有位置满足统一的显式 DPI。接口会要求省略 `dpi` 保留原始像素，或将各放置位置导出为独立图像对象。
 
+## PDF 与二维码工具
+
+这两个接口在 Swagger 中共用 **PDF 与二维码工具** 标签，使用独立的 CPU 工具队列，不等待 GPU 颜色任务。默认直接返回文件；加 `?wait=false` 可返回异步任务，使用现有任务查询、取消、下载接口。结果同样写入 `output/jobs/任务ID/`，完成后保留 24 小时。
+
+### 图片放入 PDF 独立图层
+
+`POST /api/tools/place-image` 使用 `multipart/form-data`：
+
+| 字段 | 说明 |
+| --- | --- |
+| `pdf` | 原始 PDF 文件 |
+| `image` | PNG、JPEG、TIFF、BMP 或 WebP 图片；多帧图片使用第一帧 |
+| `page` | 页码，从 1 开始，默认 1 |
+| `x_mm`、`y_mm` | 距所选页面显示方向下、可见 CropBox 左上角的距离，单位毫米 |
+| `width_mm`、`height_mm` | 图片放置后的实际宽高，单位毫米，按这两个尺寸精确放置 |
+| `layer_name` | 新图层名称；每次新建独立 OCG，即使原 PDF 已有同名层也不合并 |
+
+图片矩形需完整位于页面内。输出不整页栅格化，保留原稿页数、页面尺寸、原有图像像素、矢量、图层状态和内容流；新图像保留上传像素与透明度。PDF 没有统一的全局 DPI，新图像的实际密度由其像素和指定毫米尺寸决定。支持旋转页、CropBox 偏移和 UserUnit；加密 PDF 暂不支持。
+
+```bash
+curl --fail-with-body -X POST http://127.0.0.1:5522/api/tools/place-image \
+  -F 'pdf=@input.pdf;type=application/pdf' \
+  -F 'image=@qrcode.png;type=image/png' \
+  -F 'page=1' -F 'x_mm=10' -F 'y_mm=10' \
+  -F 'width_mm=30' -F 'height_mm=30' \
+  -F 'layer_name=QR_Code' \
+  -o with-image.pdf
+```
+
+图片上传默认最多 512 MiB，解码前检查像素预算，默认最多 268,435,456 像素（256 MP），分别由 `CMYK_API_MAX_IMAGE_MIB`、`CMYK_API_MAX_IMAGE_PIXELS` 调整。该像素预算仅针对上传的新图片，不限制原 PDF 中的图像或页面尺寸；Pillow 的默认像素阈值不会额外阻止符合该预算的图片。
+
+### 链接转透明背景二维码
+
+`POST /api/tools/qrcode` 使用 JSON，返回 `image/png`：
+
+```bash
+curl --fail-with-body -X POST http://127.0.0.1:5522/api/tools/qrcode \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/product?id=123"}' \
+  -o qrcode.png
+```
+
+二维码为黑色不透明模块、透明背景和四格透明边框；标准 QR、M 级纠错、每格 10 像素。链接必须是有效 HTTP/HTTPS URL，按原文编码，不访问链接，也不改写大小写、query 或百分号转义。超出单个二维码容量时返回 422，不截断内容。使用 [Segno](https://segno.readthedocs.io/en/latest/) 生成；测试会合成白底后通过 ZXing 实际反读校验。
+
 ## CMYK–Lab CSV
 
 支持 UTF-8（含 BOM）和 GB18030。标准表头是：
@@ -169,6 +213,8 @@ PDF 按块处理；单张原生嵌入图像或其重采样目标超过 6400 万�
 | `CMYK_API_OUTPUT_DIR` | `./output` | 宿主机/裸机输出目录；Compose 将其绑定到 `/data` |
 | `CMYK_API_MAX_UPLOAD_GIB` | `64` | 单个 PDF 上传大小上限 |
 | `CMYK_API_MAX_CSV_MIB` | `64` | 单个 CSV 上传大小上限 |
+| `CMYK_API_MAX_IMAGE_MIB` | `512` | 放图接口上传图片的大小上限 |
+| `CMYK_API_MAX_IMAGE_PIXELS` | `268435456` | 放图接口上传图片的像素预算 |
 | `CMYK_API_UPLOAD_CHUNK_MIB` | `8` | 上传拷贝块大小 |
 | `CMYK_API_MAX_PENDING_JOBS` | `4` | 任务容量限制 |
 | `CMYK_API_JOB_TTL_HOURS` | `24` | 最终 PDF 从任务完成时起的保留时间；到期清理后无法下载 |

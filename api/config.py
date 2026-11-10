@@ -25,6 +25,8 @@ class Settings:
     work_dir: Path
     max_upload_bytes: int = 64 * 1024**3
     max_csv_bytes: int = 64 * 1024**2
+    max_image_bytes: int = 512 * 1024**2
+    max_image_pixels: int = 268_435_456
     upload_chunk_bytes: int = 8 * 1024**2
     max_pending_jobs: int = 4
     force_cpu: bool = False
@@ -40,6 +42,8 @@ class Settings:
             work_dir=Path(os.getenv("CMYK_API_WORK_DIR", output_dir)).expanduser().resolve(),
             max_upload_bytes=_positive_int("CMYK_API_MAX_UPLOAD_GIB", 64) * 1024**3,
             max_csv_bytes=_positive_int("CMYK_API_MAX_CSV_MIB", 64) * 1024**2,
+            max_image_bytes=_positive_int("CMYK_API_MAX_IMAGE_MIB", 512) * 1024**2,
+            max_image_pixels=_positive_int("CMYK_API_MAX_IMAGE_PIXELS", 268_435_456),
             upload_chunk_bytes=_positive_int("CMYK_API_UPLOAD_CHUNK_MIB", 8) * 1024**2,
             max_pending_jobs=_positive_int("CMYK_API_MAX_PENDING_JOBS", 4),
             force_cpu=os.getenv("CMYK_API_FORCE_CPU", "false").lower() in {"1", "true", "yes", "on"},
