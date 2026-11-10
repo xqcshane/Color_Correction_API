@@ -13,8 +13,22 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CUPY_CACHE_DIR=/data/cupy-cache \
     TMPDIR=/data/tmp
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates \
+# Use authenticated Ubuntu mirrors and avoid stale proxy indexes during mirror sync.
+# Keep by-hash optional for third-party repositories that do not support it.
+RUN find /etc/apt -maxdepth 2 -type f \( -name '*.list' -o -name '*.sources' \) \
+      -exec sed -i \
+        -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+        -e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' {} + \
+    && printf '%s\n' \
+        'Acquire::By-Hash "true";' \
+        'Acquire::Retries "3";' \
+        'Acquire::http::Timeout "20";' \
+        'Acquire::https::Timeout "20";' \
+        'Acquire::http::No-Cache "true";' \
+        'Acquire::https::No-Cache "true";' \
+        > /etc/apt/apt.conf.d/80-colorapi-network \
+    && timeout 240s apt-get update \
+    && timeout 300s apt-get install -y --no-install-recommends python3 python3-venv ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m venv /opt/venv
 
