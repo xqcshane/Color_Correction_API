@@ -168,18 +168,22 @@ def test_native_image_replacement_keeps_xref_bbox_and_density(tmp_path: Path) ->
 
 def test_explicit_density_really_resamples_native_artwork(tmp_path: Path) -> None:
     source, output = tmp_path / "source.pdf", tmp_path / "output.pdf"
-    texture, cutline, _ = _create_image_layered_pdf(source)
+    texture, cutline, image_xref = _create_image_layered_pdf(source)
+    with pymupdf.open(source) as before:
+        original_streams = {xref: before.xref_stream(xref) for xref in before[0].get_contents()}
     result = replace_pdf_layers(
         source, output, selected_layer_xrefs=[texture], dpi=72,
         mapper=_cyan_mapper, preserve_native_density=False,
     )
-    assert result["replacementMode"] == "ocg-overlay"
+    assert result["replacementMode"] == "native-images"
     with pymupdf.open(output) as document:
         assert document.get_ocgs()[cutline]["on"]
-        replacement = result["replacementLayers"][str(texture)]
-        images = [item for item in document[0].get_image_info(xrefs=True) if document.get_oc(item["xref"]) == replacement]
+        assert document.get_ocgs()[texture]["on"]
+        images = [item for item in document[0].get_image_info(xrefs=True) if item["xref"] == image_xref]
         assert images and max(item["width"] for item in images) == 240
         assert max(item["height"] for item in images) == 120
+        for xref, content in original_streams.items():
+            assert document.xref_stream(xref) == content
 
 
 def test_unlayered_background_and_upper_guides_keep_stacking(tmp_path: Path) -> None:
@@ -339,4 +343,76 @@ def test_single_layer_nested_form_keeps_transform(tmp_path: Path) -> None:
         pixels = np.frombuffer(document[0].get_pixmap(colorspace=pymupdf.csRGB).samples, dtype=np.uint8).reshape(100, 200, 3)
         assert pixels[30, 80, 0] < 100
         assert np.all(pixels[10, 10] > 250)
+
+
+def test_native_resample_clones_shared_soft_mask(tmp_path: Path) -> None:
+    source, output = tmp_path / "shared-mask.pdf", tmp_path / "output.pdf"
+    document = pymupdf.open()
+    page = document.new_page(width=480, height=120)
+    artwork, technical = document.add_ocg("Artwork"), document.add_ocg("Technical")
+    rgb = np.zeros((60, 120, 3), dtype=np.uint8)
+    rgb[..., 0] = 220
+    alpha = np.broadcast_to(np.linspace(0, 255, 120, dtype=np.uint8), (60, 120))
+    pixmap = pymupdf.Pixmap(pymupdf.csRGB, 120, 60, rgb.tobytes(), False)
+    rgba = pymupdf.Pixmap(pixmap, 1)
+    rgba.set_alpha(np.ascontiguousarray(alpha).tobytes(), premultiply=1)
+    selected_image = page.insert_image(pymupdf.Rect(0, 0, 240, 120), pixmap=rgba, oc=artwork)
+    mask_xref = int(document.xref_get_key(selected_image, "SMask")[1].split()[0])
+    rgb[..., 0] = 0
+    rgb[..., 2] = 220
+    other_image = page.insert_image(pymupdf.Rect(240, 0, 480, 120), pixmap=pymupdf.Pixmap(pymupdf.csRGB, 120, 60, rgb.tobytes(), False), oc=technical)
+    document.xref_set_key(other_image, "SMask", f"{mask_xref} 0 R")
+    document.save(source, deflate=True)
+    document.close()
+    with pymupdf.open(source) as document:
+        original_mask = document.xref_stream(mask_xref)
+        original_other = document.xref_stream(other_image)
+        original_other_object = document.xref_object(other_image)
+        original_mask_object = document.xref_object(mask_xref)
+    result = replace_pdf_layers(source, output, selected_layer_xrefs=[artwork], dpi=72, mapper=_cyan_mapper, preserve_native_density=False)
+    assert result["replacementMode"] == "native-images"
+    with pymupdf.open(output) as document:
+        new_mask = int(document.xref_get_key(selected_image, "SMask")[1].split()[0])
+        assert new_mask != mask_xref
+        assert document.xref_get_key(new_mask, "Width") == ("int", "240")
+        assert document.xref_get_key(new_mask, "Height") == ("int", "120")
+        assert document.xref_get_key(new_mask, "BitsPerComponent") == ("int", "8")
+        assert document.xref_get_key(selected_image, "Width") == ("int", "240")
+        assert document.xref_stream(mask_xref) == original_mask
+        assert document.xref_stream(other_image) == original_other
+        assert document.xref_object(other_image) == original_other_object
+        assert document.xref_object(mask_xref) == original_mask_object
+        scaled_alpha = np.frombuffer(document.xref_stream(new_mask), dtype=np.uint8).reshape(120, 240)
+        assert 100 < scaled_alpha[60, 120] < 160
+
+
+def test_native_resample_respects_rotated_image_axes(tmp_path: Path) -> None:
+    source, output = tmp_path / "rotated.pdf", tmp_path / "output.pdf"
+    document = pymupdf.open()
+    page = document.new_page(width=120, height=240)
+    artwork = document.add_ocg("Artwork")
+    rgb = np.full((60, 120, 3), 100, dtype=np.uint8)
+    image_xref = page.insert_image(page.rect, pixmap=pymupdf.Pixmap(pymupdf.csRGB, 120, 60, rgb.tobytes(), False), rotate=90, oc=artwork)
+    before_bbox = page.get_image_info()[0]["bbox"]
+    document.save(source)
+    document.close()
+    replace_pdf_layers(source, output, selected_layer_xrefs=[artwork], dpi=72, mapper=_cyan_mapper, preserve_native_density=False)
+    with pymupdf.open(output) as document:
+        assert document.xref_get_key(image_xref, "Width") == ("int", "240")
+        assert document.xref_get_key(image_xref, "Height") == ("int", "120")
+        assert document[0].get_image_info()[0]["bbox"] == pytest.approx(before_bbox)
+
+
+def test_explicit_density_rejects_shared_image_at_different_scales(tmp_path: Path) -> None:
+    source, output = tmp_path / "reused.pdf", tmp_path / "output.pdf"
+    document = pymupdf.open()
+    page = document.new_page(width=400, height=100)
+    artwork = document.add_ocg("Artwork")
+    rgb = np.full((60, 120, 3), 100, dtype=np.uint8)
+    image_xref = page.insert_image(pymupdf.Rect(0, 0, 200, 100), pixmap=pymupdf.Pixmap(pymupdf.csRGB, 120, 60, rgb.tobytes(), False), oc=artwork)
+    page.insert_image(pymupdf.Rect(200, 0, 300, 50), xref=image_xref)
+    document.save(source)
+    document.close()
+    with pytest.raises(PdfEngineError, match="不同尺寸下复用"):
+        replace_pdf_layers(source, output, selected_layer_xrefs=[artwork], dpi=72, mapper=_cyan_mapper, preserve_native_density=False)
 

@@ -669,9 +669,14 @@ def _process_native_image(
     progress: Callable[[Mapping[str, Any]], None] | None,
     stats: dict[str, Any],
     temporary_directory: Path,
+    target_size: tuple[int, int] | None = None,
+    resampled_masks: dict[int, int] | None = None,
 ) -> int:
     np = _numpy()
     pixmap = _load_native_pixmap(document, image)
+    resampled = target_size is not None and target_size != (image.width, image.height)
+    if resampled:
+        pixmap = _pymupdf().Pixmap(pixmap, float(target_size[0]), float(target_size[1]))
     width, height = int(pixmap.width), int(pixmap.height)
     # Keep the owning pixmap alive; samples_mv does not duplicate a potentially
     # hundreds-of-megabytes image. Unpremultiply only the tile sent to the GPU.
@@ -747,6 +752,25 @@ def _process_native_image(
                         }
                     )
         output.flush()
+        if resampled and image.smask:
+            # A soft mask can be shared by an unselected image. Clone it before
+            # changing geometry; only the selected image points at the clone.
+            mask_xref = document.get_new_xref()
+            document.update_object(mask_xref, document.xref_object(image.smask))
+            document.xref_set_key(mask_xref, "Width", str(width))
+            document.xref_set_key(mask_xref, "Height", str(height))
+            document.xref_set_key(mask_xref, "ColorSpace", "/DeviceGray")
+            document.xref_set_key(mask_xref, "BitsPerComponent", "8")
+            document.xref_set_key(mask_xref, "Decode", "null")
+            document.xref_set_key(mask_xref, "DecodeParms", "null")
+            document.xref_set_key(mask_xref, "Matte", "null")
+            document.xref_set_key(mask_xref, "Filter", "null")
+            document.update_stream(mask_xref, np.ascontiguousarray(source[..., 3]).tobytes(), compress=True)
+            document.xref_set_key(image.xref, "SMask", f"{mask_xref} 0 R")
+            if resampled_masks is not None:
+                resampled_masks[image.xref] = mask_xref
+        document.xref_set_key(image.xref, "Width", str(width))
+        document.xref_set_key(image.xref, "Height", str(height))
         document.xref_set_key(image.xref, "ColorSpace", "/DeviceCMYK")
         document.xref_set_key(image.xref, "BitsPerComponent", "8")
         document.xref_set_key(image.xref, "Decode", "null")
@@ -774,12 +798,16 @@ def _replace_native_layer_images(
     progress: Callable[[Mapping[str, Any]], None] | None,
     stats: dict[str, Any],
     temporary_directory: Path,
+    target_sizes: Mapping[int, tuple[int, int]] | None = None,
+    resampled_masks: dict[int, int] | None = None,
 ) -> dict[int, list[int]]:
     if any(not direct_layers.get(layer_xref) for layer_xref in selected):
         raise PdfEngineError("所选图层不能使用原生图像替换")
     images = [image for layer_xref in selected for image in direct_layers[layer_xref] or ()]
+    target_sizes = target_sizes or {}
     total_tasks = sum(
-        math.ceil(image.width / tile_size) * math.ceil(image.height / tile_size)
+        math.ceil(target_sizes.get(image.xref, (image.width, image.height))[0] / tile_size)
+        * math.ceil(target_sizes.get(image.xref, (image.width, image.height))[1] / tile_size)
         for image in images
     )
     completed = 0
@@ -797,10 +825,44 @@ def _replace_native_layer_images(
             progress=progress,
             stats=stats,
             temporary_directory=temporary_directory,
+            target_size=target_sizes.get(image.xref),
+            resampled_masks=resampled_masks,
         )
         replacements[image.layer_xref].append(image.xref)
         completed += image_tasks
     return replacements
+
+
+def _native_resample_sizes(document: Any, images: Sequence[LayerImage], dpi: float) -> dict[int, tuple[int, int]]:
+    """Compute pixels from actual image-axis lengths, including rotated forms.
+
+    One shared xref cannot have different pixel dimensions per occurrence. In
+    that case reject explicit density rather than silently use the largest
+    placement and misrepresent the density of every smaller placement.
+    """
+    sizes: dict[int, set[tuple[int, int]]] = {image.xref: set() for image in images}
+    for page in document:
+        for info in page.get_image_info(xrefs=True):
+            image_xref = int(info.get("xref") or 0)
+            if image_xref not in sizes:
+                continue
+            transform = info.get("transform")
+            if not transform or len(transform) < 4:
+                raise PdfEngineError("无法确定嵌入图像的实际放置尺寸，请重新导出 PDF")
+            a, b, c, d = map(float, transform[:4])
+            width = max(1, round(math.hypot(a, b) * dpi / POINTS_PER_INCH))
+            height = max(1, round(math.hypot(c, d) * dpi / POINTS_PER_INCH))
+            sizes[image_xref].add((width, height))
+    result: dict[int, tuple[int, int]] = {}
+    for image in images:
+        candidates = sizes[image.xref]
+        if len(candidates) != 1:
+            raise PdfEngineError(
+                f"图像 {image.xref} 在不同尺寸下复用，无法在保留原始对象位置时统一设定 DPI；"
+                "请省略 dpi 保留原稿像素，或将各放置位置导出为独立图像"
+            )
+        result[image.xref] = next(iter(candidates))
+    return result
 
 
 def _render_tile_rgba(page: Any, plan: TilePlan) -> tuple[bytes, int, int]:
@@ -1377,7 +1439,8 @@ def replace_pdf_layers(
     """Replace selected OCG layers while preserving every unselected PDF object.
 
     Image-only OCGs use native image replacement, preserving each image xref,
-    transform, bounding box and pixel dimensions. Other OCGs use a seam-safe
+    transform and bounding box. Native pixel dimensions are retained by default;
+    explicit density resamples pixels and clones any resized soft mask. Other OCGs use a seam-safe
     raster overlay: the selected original OCG defaults to OFF and a mapped OCG
     defaults to ON. Unselected layers are never rendered or rebuilt.
     """
@@ -1435,18 +1498,26 @@ def replace_pdf_layers(
             str(source_ocgs[xref].get("name") or f"图层 {xref}") for xref in selected
         ]
         direct_layers = _discover_direct_layer_images(output_document)
-        # Native replacement preserves the original pixel dimensions. An
-        # explicit density request must take the rendering path instead.
+        # Safe image-only layers can also be resampled in place. Keeping the
+        # image xref and its original painting operators preserves ordering,
+        # even inside forms containing interleaved technical content.
         # Keep huge images out of the native path, whose PDF stream API must
         # materialise one complete image at the final write step.
         native_max_pixels = max(1, int(os.getenv("CMYK_PDF_NATIVE_MAX_PIXELS", "64000000")))
-        direct_mode = preserve_native_density and all(
-            direct_layers.get(xref)
-            and all(image.width * image.height <= native_max_pixels for image in direct_layers[xref] or ())
-            for xref in selected
+        direct_images = [image for xref in selected for image in direct_layers.get(xref) or ()]
+        direct_mode = all(direct_layers.get(xref) for xref in selected)
+        target_sizes = (
+            _native_resample_sizes(output_document, direct_images, dpi)
+            if direct_mode and not preserve_native_density else {}
+        )
+        direct_mode = direct_mode and all(
+            image.width * image.height <= native_max_pixels
+            and math.prod(target_sizes.get(image.xref, (image.width, image.height))) <= native_max_pixels
+            for image in direct_images
         )
         overlay_replacements: dict[int, int] = {}
         native_replacements: dict[int, list[int]] = {}
+        resampled_masks: dict[int, int] = {}
         if direct_mode:
             with tempfile.TemporaryDirectory(
                 prefix="cmyk-pdf-", dir=str(output.parent)
@@ -1461,6 +1532,8 @@ def replace_pdf_layers(
                     progress=progress,
                     stats=stats,
                     temporary_directory=Path(temp_dir),
+                    target_sizes=target_sizes,
+                    resampled_masks=resampled_masks,
                 )
             replacement_mode = "native-images"
         else:
@@ -1538,7 +1611,10 @@ def replace_pdf_layers(
                         "8",
                     ):
                         raise PdfEngineError("原生图像不是 8-bit CMYK")
-            if verification.xref_length() != source_xref_length:
+            for image_xref, (width, height) in target_sizes.items():
+                if verification.xref_get_key(image_xref, "Width") != ("int", str(width)) or verification.xref_get_key(image_xref, "Height") != ("int", str(height)):
+                    raise PdfEngineError("原生图像重采样后的像素尺寸不正确")
+            if verification.xref_length() != source_xref_length + len(resampled_masks):
                 raise PdfEngineError("原生图像替换意外新增了 PDF 对象")
 
     return {
@@ -1564,6 +1640,11 @@ def replace_pdf_layers(
         "replacedImageXrefs": {
             str(layer_xref): image_xrefs
             for layer_xref, image_xrefs in native_replacements.items()
+        },
+        "resampledImagePixels": {
+            str(image_xref): {"width": size[0], "height": size[1]}
+            for image_xref, size in target_sizes.items()
+            if replacement_mode == "native-images"
         },
         "stats": stats,
         "unselectedObjectsPreserved": True,

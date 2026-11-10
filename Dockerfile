@@ -25,7 +25,7 @@ RUN python -m pip install --upgrade pip \
     && python -m pip check
 
 COPY api /app/api
-COPY scripts/healthcheck.py /app/scripts/healthcheck.py
+COPY scripts /app/scripts
 RUN groupadd --gid 10001 colorapi \
     && useradd --uid 10001 --gid colorapi --no-create-home colorapi \
     && mkdir -p /data/tmp /data/cupy-cache \
