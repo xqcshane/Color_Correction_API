@@ -107,7 +107,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         jobs.shutdown()
 
     app = FastAPI(title="Color Correction API", version=__version__, lifespan=lifespan,
-                  docs_url="/api/docs", openapi_url="/api/openapi.json")
+                  docs_url="/docs", openapi_url="/openapi.json")
     app.state.settings, app.state.jobs = settings, jobs
     app.add_middleware(BodyLimitMiddleware,
                        max_bytes=settings.max_upload_bytes + settings.max_csv_bytes + 1024**2)

@@ -49,4 +49,4 @@ if ! docker compose up -d --wait --wait-timeout "$timeout" color-api; then
   exit 1
 fi
 docker compose ps
-printf 'Ready: http://localhost:5522/api/docs\n'
+printf 'Ready: http://localhost:5522/docs\n'

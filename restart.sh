@@ -23,4 +23,4 @@ if ! docker compose up -d --no-build --force-recreate --wait --wait-timeout "$ti
   exit 1
 fi
 docker compose ps
-printf 'Ready: http://localhost:5522/api/docs\n'
+printf 'Ready: http://localhost:5522/docs\n'

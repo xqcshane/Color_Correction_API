@@ -15,7 +15,7 @@ cp .env.example .env
 bash deploy.sh
 ```
 
-成功后接口地址为 `http://服务器IP:5522`，交互文档位于 `/api/docs`，OpenAPI 位于 `/api/openapi.json`。
+成功后接口地址为 `http://服务器IP:5522`，交互文档位于 `/docs`，OpenAPI 位于 `/openapi.json`。
 
 ```bash
 # 更新当前跟踪分支、构建并部署（本地有改动则停止，不覆盖改动）
