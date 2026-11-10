@@ -36,9 +36,22 @@ curl --fail http://127.0.0.1:5522/api/capabilities
 
 `deploy.sh` 构建镜像后等待 Docker 健康检查成功，`restart.sh` 不重新构建镜像。健康检查访问 `/api/ready`，GPU 检查会执行并同步 CUDA 内核。GPU 不可用时，生产接口返回 503，不会自动以 CPU 完成生产任务。
 
-数据默认写入仓库下的 `output/`，Docker 将其绑定到容器 `/data`。部署和重启脚本会准备该目录，用镜像内的 Python 临时以 root 初始化 `/data`、`jobs`、`tmp`、`cupy-cache` 四个顶层目录的权限，API 本身仍以 uid **10001** 运行；不会递归修改已有任务文件。脚本拒绝将仓库根、家目录、系统顶层目录、符号链接或含其他非 API 项目的目录用作输出目录。服务器无需另装 Python 或 jq。
+数据默认写入仓库下的 `output/`，Docker 将其绑定到容器 `/data`。部署和重启脚本会准备该目录，用镜像内的 Python 临时以 root 初始化 `/data`、`jobs`、`tmp`、`cupy-cache` 四个顶层目录的权限，再以 API 实际运行用户 uid **10001** 在四个目录创建、写入并删除独立校验文件；任何校验失败都会阻止启动并输出目录 owner、mode 和进程 UID。API 本身仍以 uid **10001** 运行，不会递归修改已有任务文件。脚本拒绝将仓库根、家目录、系统顶层目录、符号链接或含其他非 API 项目的目录用作输出目录。服务器无需另装 Python 或 jq。
 
 从旧命名卷配置升级时，旧 `runtime-data` 卷和原有 `runtime/` 目录不会自动搬迁或删除。新的 `output/` 不会自动显示旧目录/卷中的任务；如需迁移已有结果，应单独安排停服迁移。
+
+### output 目录权限排错
+
+若容器日志出现 `PermissionError: [Errno 13] Permission denied: '/data/cupy-cache'`，表示 API 运行用户无法写入挂载目录。从旧版本执行 `bash deploy.sh --pull` 升级时，Git 可能已经替换脚本文件，而当前 Bash 仍继续执行旧脚本内容，漏掉新增的目录准备步骤。新版 `--pull` 会重新打开更新后的脚本执行，避免这项升级问题。
+
+已经完成代码更新、镜像版本正确但目录权限尚未初始化时，可在仓库目录执行：
+
+```bash
+git pull --ff-only
+bash restart.sh
+```
+
+这会先初始化顶层目录权限并验证 uid 10001 可写，再重建当前镜像的容器。若预检仍失败，先查看输出的宿主 bind 路径、目录 owner/mode 和具体失败目录；owner/mode 正确时还需检查宿主 ACL、SELinux 或 NFS 挂载策略。脚本不会自动更改这些宿主策略。
 
 ## 本地测试网页
 
@@ -135,7 +148,7 @@ curl --fail -X DELETE http://127.0.0.1:5522/api/jobs/JOB_ID
 
 默认只使用一个 GPU 工作线程，其他任务排队，防止单张 3090 被并发模型占满显存。容器重建保留未过期的已完成结果；重启时尚未完成的任务会标记失败，需要重新提交。
 
-裸机默认数据目录为仓库 `output/`；Compose 默认将同一个宿主目录绑定到容器 `/data`。可用 `CMYK_API_OUTPUT_DIR` 更改输出位置，裸机显式设置 `CMYK_API_WORK_DIR` 时优先使用该值。上传、结果、临时文件和 GPU 编译缓存都保存在输出目录，不把整份上传 PDF 留在 Python 内存里。该目录不会提交到 Git 或加入 Docker 构建上下文。
+裸机默认数据目录为仓库 `output/`；Compose 默认将同一个宿主目录绑定到容器 `/data`。可用 `CMYK_API_OUTPUT_DIR` 更改输出位置，裸机显式设置 `CMYK_API_WORK_DIR` 时优先使用该值。上传、结果、临时文件和 GPU 编译缓存都保存在输出目录，不把整份上传 PDF 留在 Python 内存里。`output/` 与误拼目录 `outpot/` 均已从 Git 和 Docker 构建上下文排除。
 
 任务完成后立即清理上传的 PDF、CSV 和中间文件，最终 PDF 从完成时间起保留 **24 小时**，下载不会延长保留期限。服务每 **1 小时**自动巡检，即使没有 API 请求也会清理到期结果；结果达到保留期限后在后续巡检中删除。临时文件及 GPU 编译缓存默认也按 **24 小时**期限清理。正在上传、排队、运行或下载的任务会受到保护，避免清理打断处理或下载。
 

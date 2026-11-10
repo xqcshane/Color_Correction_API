@@ -131,3 +131,64 @@ def test_missing_output_root_is_not_created_or_owned_implicitly(tmp_path, owners
         prepare_storage.prepare(root)
     ownership.assert_not_called()
     assert not root.exists()
+
+
+@pytest.fixture
+def api_identity(monkeypatch):
+    monkeypatch.setattr(prepare_storage.os, "geteuid", lambda: 10001, raising=False)
+    monkeypatch.setattr(prepare_storage.os, "getegid", lambda: 10001, raising=False)
+
+
+def test_verify_writes_all_four_directories_without_chown_or_leftover_probes(tmp_path, ownership, api_identity, capsys):
+    root = tmp_path / "output"
+    root.mkdir()
+    prepare_storage.prepare(root)
+    existing = root / "jobs" / "result.pdf"
+    existing.write_bytes(b"existing result")
+    ownership.reset_mock()
+    prepare_storage.verify(root)
+    ownership.assert_not_called()
+    assert existing.read_bytes() == b"existing result"
+    assert not list(root.rglob(".colorapi-write-check-*"))
+    output = capsys.readouterr()
+    assert output.out.count("OK   ") == 4
+    assert "process uid=10001 gid=10001" in output.out
+    assert not output.err
+
+
+@pytest.mark.parametrize("name", [None, *prepare_storage.DIRECTORIES])
+def test_verify_reports_owner_mode_and_path_when_any_directory_is_unwritable(
+        tmp_path, ownership, api_identity, monkeypatch, capsys, name):
+    root = tmp_path / "output"
+    root.mkdir()
+    prepare_storage.prepare(root)
+    blocked = root if name is None else root / name
+    original = prepare_storage.tempfile.NamedTemporaryFile
+
+    def denied_probe(*args, **kwargs):
+        if Path(kwargs["dir"]) == blocked:
+            raise PermissionError(13, "Permission denied", str(blocked))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(prepare_storage.tempfile, "NamedTemporaryFile", denied_probe)
+    ownership.reset_mock()
+    with pytest.raises(PermissionError, match="API uid 10001 写入失败"):
+        prepare_storage.verify(root)
+    ownership.assert_not_called()
+    output = capsys.readouterr()
+    assert str(blocked) in output.err
+    assert "uid=" in output.err and "gid=" in output.err and "mode=" in output.err
+    assert "Permission denied" in output.err
+    assert output.out.count("OK   ") == 3
+    assert not list(root.rglob(".colorapi-write-check-*"))
+
+
+def test_verify_refuses_root_so_it_cannot_report_a_false_nonroot_success(tmp_path, ownership, monkeypatch):
+    monkeypatch.setattr(prepare_storage.os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr(prepare_storage.os, "getegid", lambda: 0, raising=False)
+    probe = Mock()
+    monkeypatch.setattr(prepare_storage.tempfile, "NamedTemporaryFile", probe)
+    with pytest.raises(PermissionError, match="必须使用 API uid 10001"):
+        prepare_storage.verify(tmp_path)
+    probe.assert_not_called()
+    ownership.assert_not_called()

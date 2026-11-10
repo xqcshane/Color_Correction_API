@@ -28,6 +28,9 @@ if "$pull"; then
     exit 1
   fi
   git pull --ff-only
+  # Git can atomically replace this script while Bash still reads its old fd.
+  # Reopen the updated file; omit --pull to avoid an update loop.
+  exec bash ./deploy.sh
 fi
 
 if [[ ! -f .env ]]; then

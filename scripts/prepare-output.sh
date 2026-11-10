@@ -31,7 +31,18 @@ if [[ -e "$storage_canonical" && ! -d "$storage_canonical" ]]; then
 fi
 
 mkdir -p -- "$storage_canonical"
-docker run --rm --user 0 --env NVIDIA_VISIBLE_DEVICES=void --env TMPDIR=/tmp \
+printf 'Preparing API output: %s (container /data)\n' "$storage_canonical"
+if ! docker run --rm --user 0 --env NVIDIA_VISIBLE_DEVICES=void --env TMPDIR=/tmp \
   --mount "type=bind,source=$storage_canonical,target=/data" --entrypoint python \
-  color-correction-api:local -c "$storage_helper" prepare
+  color-correction-api:local -c "$storage_helper" prepare; then
+  printf 'Output directory initialization failed; API startup was not attempted.\n' >&2
+  exit 1
+fi
+if ! docker run --rm --user 10001:10001 --env NVIDIA_VISIBLE_DEVICES=void --env TMPDIR=/tmp \
+  --mount "type=bind,source=$storage_canonical,target=/data" --entrypoint python \
+  color-correction-api:local -c "$storage_helper" verify; then
+  printf 'API uid 10001 cannot write the output bind mount; startup was not attempted.\n' >&2
+  printf 'Inspect the directory owner/mode above and host mount/ACL policy.\n' >&2
+  exit 1
+fi
 printf 'API output: %s (container /data; uid 10001)\n' "$storage_canonical"

@@ -10,6 +10,7 @@ import os
 from pathlib import Path, PurePosixPath
 import stat
 import sys
+import tempfile
 
 
 DIRECTORIES = ("jobs", "tmp", "cupy-cache")
@@ -49,17 +50,60 @@ def prepare(root: Path = Path("/data")) -> None:
         path.chmod(stat.S_IMODE(path.stat().st_mode) | stat.S_IRWXU)
 
 
+def describe(path: Path) -> str:
+    try:
+        info = path.lstat()
+        return f"{path}: uid={info.st_uid} gid={info.st_gid} mode={stat.filemode(info.st_mode)}"
+    except OSError as exc:
+        return f"{path}: 无法读取目录属性：{exc}"
+
+
+def verify(root: Path = Path("/data")) -> None:
+    uid, gid = os.geteuid(), os.getegid()
+    if uid != 10001:
+        raise PermissionError(f"写入校验必须使用 API uid 10001，当前 uid={uid} gid={gid}")
+    print(f"Output write check: process uid={uid} gid={gid}", flush=True)
+    failed = []
+    for path in (root, *(root / name for name in DIRECTORIES)):
+        try:
+            if path.is_symlink() or not path.is_dir():
+                raise PermissionError("必须是已初始化的真实目录")
+            # Probe a new unique file only. Existing uploads/results are never
+            # opened or modified, and the probe is removed before returning.
+            with tempfile.NamedTemporaryFile(dir=path, prefix=".colorapi-write-check-") as probe:
+                probe.write(b"color-api storage write check\n")
+                probe.flush()
+                os.fsync(probe.fileno())
+                probe.seek(0)
+                if probe.read() != b"color-api storage write check\n":
+                    raise OSError("写入校验内容不一致")
+        except OSError as exc:
+            failed.append(path)
+            print(f"FAIL {describe(path)}; {exc}", file=sys.stderr, flush=True)
+        else:
+            print(f"OK   {describe(path)}", flush=True)
+    if failed:
+        raise PermissionError(
+            f"API uid 10001 写入失败：{', '.join(str(path) for path in failed)}。"
+            "请检查 bind 源路径、owner/mode 及宿主机 ACL/SELinux/NFS 挂载策略；不会自动修改这些策略。")
+
+
 def main() -> None:
     if sys.argv[1:] == ["resolve"]:
         print(output_source(json.load(sys.stdin)))
     elif sys.argv[1:] == ["prepare"]:
         prepare()
+    elif sys.argv[1:] == ["verify"]:
+        verify()
     else:
-        raise ValueError("Usage: prepare_storage.py resolve|prepare")
+        raise ValueError("Usage: prepare_storage.py resolve|prepare|verify")
 
 
 if __name__ == "__main__":
     try:
         main()
     except (OSError, ValueError, KeyError) as exc:
+        if sys.argv[1:] == ["prepare"]:
+            for path in (Path("/data"), *(Path("/data") / name for name in DIRECTORIES)):
+                print(describe(path), file=sys.stderr)
         raise SystemExit(f"Output preparation failed: {exc}") from exc

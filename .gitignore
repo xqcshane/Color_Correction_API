@@ -14,3 +14,4 @@ reference_tests/
 *.tif
 *.tiff
 *.log
+outpot/
