@@ -1,6 +1,6 @@
 # Color Correction API
 
-从 CMYK Recipe Studio 提取的独立 PDF 颜色校正服务。提供两个 GPU 接口，输入 PDF、CMYK–Lab CSV、需要处理的图层名称和可选输出 DPI，输出 PDF。默认使用精细算法和原稿密度。没有网页界面，不生成布料/设备右下角标注。
+从 CMYK Recipe Studio 提取的独立 PDF 颜色校正服务。提供两个 GPU 接口，输入 PDF、CMYK–Lab CSV、需要处理的图层名称和可选输出 DPI，输出 PDF。默认使用精细算法和原稿密度，不生成布料/设备右下角标注。仓库另附独立运行的本地测试网页。
 
 ## 部署（Linux + RTX 3090）
 
@@ -35,6 +35,18 @@ curl --fail http://127.0.0.1:5522/api/capabilities
 ```
 
 `deploy.sh` 构建镜像后等待 Docker 健康检查成功，`restart.sh` 不重新构建镜像。健康检查访问 `/api/ready`，GPU 检查会执行并同步 CUDA 内核。GPU 不可用时，生产接口返回 503，不会自动以 CPU 完成生产任务。
+
+## 本地测试网页
+
+先确保 `http://localhost:5522/api/ready` 返回成功，再在仓库根目录运行：
+
+```bash
+python -m demo.server
+```
+
+打开 `http://127.0.0.1:5533/`。网页服务器只需 Python 标准库，无需另装 GPU 依赖；GPU 计算由已启动的 API 完成。前端 HTML/CSS/JS 位于 `demo/dist`，通过独立的同源代理流式上传和下载。生产 API 镜像不包含 demo。更换 API 地址、端口等用法见 [demo 说明](demo/README.md)。
+
+“使用示例文件”生成合成 PDF 和合成 CMYK–Lab CSV，仅供测试流程。预览使用本地 PDF.js **6.5.438**，不依赖 CDN，只绘制第一页；超过 **80 MiB** 的文件需要手动加载预览。结果预览通过 Range 按需请求，实际读取量和浏览器内存取决于 PDF 结构。完整结果 PDF 使用浏览器原生下载。
 
 ## 两个 PDF 接口
 

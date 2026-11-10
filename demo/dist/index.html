@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light"><meta name="theme-color" content="#f2f4f1">
+  <title>色谱 · Color Correction Demo</title>
+  <link rel="stylesheet" href="/styles.css"><script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="色谱工作台首页"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span><strong>色谱<span>COLOR API</span></strong></a>
+    <span class="nav-context">PDF 颜色校正工作台 <span class="demo-tag">DEMO</span></span>
+    <div class="top-actions"><span id="connectionBadge" class="connection"><i></i><span id="connectionText">正在连接服务</span></span><a id="docsLink" class="text-link" href="http://localhost:5522/docs/" target="_blank" rel="noopener">API 文档 <span aria-hidden="true">↗</span></a></div>
+  </header>
+  <main class="workspace">
+    <div class="page-heading"><div><p class="eyebrow">MEASURED COLOR. PRECISE OUTPUT.</p><h1>让实测颜色，落在稿件上。</h1><p class="intro">上传 PDF 与 CMYK–Lab 色表，只处理你指定的图层。</p></div><div class="mode-note"><span class="quality-dot"></span>精细计算 <span class="note-divider">/</span> GPU 加速</div></div>
+    <div class="work-grid">
+      <form id="jobForm" class="settings-panel" novalidate>
+        <div class="panel-heading"><h2>处理设置</h2><button id="loadSample" type="button" class="quiet-button">使用示例文件 <span aria-hidden="true">↗</span></button></div>
+        <fieldset class="form-section"><legend><span class="section-index">01</span>导入文件</legend>
+          <label class="file-drop" id="pdfDrop" for="pdfFile"><input id="pdfFile" type="file" accept=".pdf,application/pdf"><span class="file-icon pdf-icon" aria-hidden="true">PDF</span><span class="file-copy"><strong id="pdfName">选择 PDF 稿件</strong><span id="pdfMeta">点击选择，或拖放文件至此</span></span><span class="file-add" aria-hidden="true">＋</span></label>
+          <label class="file-drop" id="csvDrop" for="csvFile"><input id="csvFile" type="file" accept=".csv,text/csv"><span class="file-icon csv-icon" aria-hidden="true">CSV</span><span class="file-copy"><strong id="csvName">选择 CMYK–Lab 色表</strong><span id="csvMeta">同一组布料与设备的测量数据</span></span><span class="file-add" aria-hidden="true">＋</span></label>
+          <p id="sampleNotice" class="field-hint sample-notice" hidden>已载入合成示例，仅用于测试接口流程。</p>
+        </fieldset>
+        <fieldset class="form-section"><legend><span class="section-index">02</span>选择算法</legend>
+          <label class="algorithm-option"><input type="radio" name="method" value="nearest" checked><span class="radio-mark"></span><span><strong>找最接近 <small>NEAREST</small></strong><span class="option-description">匹配实测色块，使用已有 CMYK 配方</span></span><span class="option-arrow" aria-hidden="true">↗</span></label>
+          <label class="algorithm-option"><input type="radio" name="method" value="predict"><span class="radio-mark"></span><span><strong>推算新色 <small>PREDICT</small></strong><span class="option-description">建立预测模型，推算新的 CMYK 配方</span></span><span class="option-arrow" aria-hidden="true">↗</span></label>
+        </fieldset>
+        <fieldset class="form-section output-section"><legend><span class="section-index">03</span>图层与输出</legend>
+          <label class="field-label" for="layers">需要处理的图层 <span>每行一个名称</span></label>
+          <textarea id="layers" rows="2" spellcheck="false" placeholder="Print_Artwork">Print_Artwork</textarea>
+          <p class="field-hint">名称需与 PDF 图层完全一致，未选图层保留。</p>
+          <div class="density-row"><div><label class="field-label" for="densityMode">输出密度</label><select id="densityMode"><option value="original">保留原稿密度</option><option value="custom">自定义 DPI</option></select></div><div class="dpi-field"><label class="field-label" for="dpi">DPI</label><input id="dpi" type="number" inputmode="decimal" min="0.1" step="0.1" value="304.8" disabled></div></div>
+          <p id="densityHint" class="field-hint">保持原稿像素密度与页面物理尺寸。</p>
+        </fieldset>
+        <div class="form-footer"><div id="formError" class="error-message" role="alert" hidden></div><button id="submitJob" type="submit" class="primary-button" disabled><span id="submitText">开始 GPU 处理</span><span aria-hidden="true">→</span></button><p class="submit-note">默认精细处理 · 输出 CMYK PDF · 不添加标注</p></div>
+      </form>
+      <div class="result-column">
+        <section class="preview-panel" aria-labelledby="previewHeading">
+          <div class="preview-header"><h2 id="previewHeading">稿件预览</h2><div class="preview-tabs" role="tablist" aria-label="PDF 预览"><button id="originalTab" type="button" role="tab" aria-selected="true" disabled>原稿</button><button id="resultTab" type="button" role="tab" aria-selected="false" disabled>处理结果</button></div></div>
+          <div class="preview-stage" id="previewStage"><div class="preview-empty" id="previewEmpty"><div class="paper-art" aria-hidden="true"><span class="crop top-left"></span><span class="crop top-right"></span><span class="crop bottom-left"></span><span class="crop bottom-right"></span><div class="paper-stripes"><span></span><span></span><span></span><span></span></div><div class="paper-lines"><i></i><i></i><i></i></div><div class="registration">＋</div></div><h3 id="previewEmptyTitle">添加 PDF，预览从这里开始</h3><p id="previewEmptyDetail">保留稿件尺寸、图层位置与透明关系。</p><button id="loadPreview" type="button" class="secondary-button" hidden>加载 PDF 预览</button></div><div id="pdfPreview" class="pdf-canvas-wrap" hidden><canvas id="pdfCanvas" class="pdf-page-canvas" role="img" aria-label="PDF 首页预览"></canvas><span id="previewPageInfo" class="preview-page-info"></span></div><div id="previewLoading" class="preview-loading" role="status" hidden>正在读取 PDF 首页…</div></div>
+          <div class="preview-caption"><span id="previewFilename">尚未选择稿件</span><span id="previewKind">PDF → DeviceCMYK</span></div>
+        </section>
+        <section class="task-panel" aria-labelledby="taskHeading">
+          <div class="task-header"><div><p class="eyebrow">PROCESSING STATUS</p><h2 id="taskHeading">等待开始</h2></div><span id="progressValue" class="progress-number">0<span>%</span></span></div>
+          <div id="progressBar" class="progress-track" role="progressbar" aria-label="当前阶段进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="progressFill"></div></div>
+          <ol class="steps"><li id="stepUpload"><i>1</i>上传文件</li><li id="stepQueue"><i>2</i>任务排队</li><li id="stepProcess"><i>3</i>GPU 处理</li><li id="stepDone"><i>4</i>PDF 完成</li></ol>
+          <p id="taskMessage" class="task-message" aria-live="polite">选择文件并设置图层后，即可开始处理。</p>
+          <div id="resultMetrics" class="result-metrics" hidden><div><span>使用设备</span><strong id="resultDevice">—</strong></div><div><span>输出密度</span><strong id="resultDensity">—</strong></div><div><span>处理时间</span><strong id="resultTime">—</strong></div></div>
+          <div class="task-bottom"><span id="jobId" class="job-id">所有处理在所连接的 API 服务完成</span><div class="task-actions"><button id="retryPoll" type="button" class="quiet-button" hidden>继续查询</button><button id="cancelJob" type="button" class="quiet-button danger" hidden>取消任务</button><button id="newJob" type="button" class="quiet-button" hidden>新建任务</button><a id="downloadPdf" class="download-button" href="#" download hidden>下载 PDF <span aria-hidden="true">↓</span></a></div></div>
+        </section>
+        <div class="service-line"><span><i id="serviceDot" class="service-dot"></i><span id="serviceDetails">正在读取 GPU 状态…</span></span><button id="refreshConnection" type="button" class="quiet-button">重新连接 <span aria-hidden="true">↻</span></button></div>
+        <details class="request-details"><summary>查看接口请求 <span id="endpointLabel">POST /api/nearest</span></summary><pre id="requestPreview"></pre></details>
+      </div>
+    </div>
+    <footer class="page-footer"><span>COLOR CORRECTION API <b>·</b> 本地联调 Demo</span><span id="apiAddress">localhost:5522</span></footer>
+  </main>
+</body>
+</html>

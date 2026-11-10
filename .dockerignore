@@ -8,6 +8,7 @@
 runtime
 api/runtime
 data
+demo
 tests
 reference_tests
 sources

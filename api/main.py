@@ -22,6 +22,7 @@ from . import __version__
 from .capabilities import detect_capabilities
 from .config import Settings
 from .csv_input import parse_pairs_csv
+from .docs_ui import swagger_docs_html
 from .jobs import JobManager, JobRecord
 from .pdf_engine import inspect_pdf
 from .processor import process_job
@@ -107,10 +108,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         jobs.shutdown()
 
     app = FastAPI(title="Color Correction API", version=__version__, lifespan=lifespan,
-                  docs_url="/docs", openapi_url="/openapi.json")
+                  docs_url=None, openapi_url="/openapi.json")
     app.state.settings, app.state.jobs = settings, jobs
     app.add_middleware(BodyLimitMiddleware,
                        max_bytes=settings.max_upload_bytes + settings.max_csv_bytes + 1024**2)
+
+    @app.get("/docs", include_in_schema=False)
+    def docs(request: Request):
+        root_path = request.scope.get("root_path", "").rstrip("/")
+        return swagger_docs_html(openapi_url=f"{root_path}{app.openapi_url}",
+                                 title=f"{app.title} - API Docs")
 
     @app.exception_handler(StarletteHTTPException)
     async def request_error(request, exc):
@@ -168,9 +175,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         "schema": {"type": "object", "required": ["pdf", "csv", "layers"], "properties": {
             "pdf": {"type": "string", "format": "binary"},
             "csv": {"type": "string", "format": "binary"},
-            "layers": {"type": "string", "description": '需处理的层名 JSON 数组，例如 ["Artwork"]'},
+            "layers": {"type": "string", "example": '["Artwork"]',
+                       "description": '需处理的层名 JSON 数组，例如 ["Artwork"]'},
             "dpi": {"type": "number", "exclusiveMinimum": 0,
-                    "description": "可选输出 DPI；省略即保持原稿密度"}
+                    "description": "可选输出 DPI；省略或留空即保持原稿密度"}
         }}}}}}
     pdf_responses = {200: {"description": "处理后的 CMYK PDF", "content": {"application/pdf": {"schema": {"type": "string", "format": "binary"}}}},
                      202: {"description": "异步任务；轮询 status_url 并下载 result_url"}}
@@ -196,7 +204,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         raise ValueError("layers 必须是非空的层名 JSON 数组")
                     if len(set(names)) != len(names):
                         raise ValueError("layers 中层名不能重复")
-                    dpi = float(form["dpi"]) if "dpi" in form else None
+                    dpi_text = str(form.get("dpi", "")).strip()
+                    dpi = float(dpi_text) if dpi_text else None
                     if dpi is not None and (not math.isfinite(dpi) or dpi <= 0):
                         raise ValueError("dpi 必须是大于 0 的有限数字")
                 except (ValueError, TypeError) as exc:

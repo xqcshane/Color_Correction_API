@@ -3,7 +3,9 @@ from __future__ import annotations
 import itertools
 import json
 from pathlib import Path
+import re
 import shutil
+import subprocess
 import threading
 import time
 from types import SimpleNamespace
@@ -120,7 +122,8 @@ def test_async_job_download_and_delete(client, artwork_pdf):
 
 @pytest.mark.parametrize("layers,dpi", [("not-json", None), ("[]", None), ('["Missing"]', None),
                                        ('["Artwork","Artwork"]', None), ('[42]', None),
-                                       ('["Artwork"]', "nan"), ('["Artwork"]', "0")])
+                                       ('["Artwork"]', "nan"), ('["Artwork"]', "0"),
+                                       ('["Artwork"]', "abc")])
 def test_bad_options_are_422_and_do_not_leave_jobs(client, artwork_pdf, layers, dpi):
     response = post_pdf(client, artwork_pdf["bytes"], layers=layers, dpi=dpi)
     assert response.status_code == 422, response.text
@@ -132,6 +135,88 @@ def test_bad_pdf_and_csv_are_422(client, artwork_pdf):
         response = post_pdf(client, pdf, csv=csv)
         assert response.status_code == 422, response.text
     assert list(client.app.state.settings.work_dir.joinpath("jobs").iterdir()) == []
+
+
+@pytest.mark.parametrize("dpi", ["", " \t "])
+def test_blank_dpi_preserves_original_native_density(client, artwork_pdf, dpi):
+    response = post_pdf(client, artwork_pdf["bytes"], dpi=dpi)
+    assert response.status_code == 200, response.text
+    record = client.app.state.jobs.require(response.headers["x-job-id"])
+    assert record.options["pdf"]["preserveNativeDensity"] is True
+    assert record.options["pdf"]["dpi"] == pytest.approx(36)
+    with pymupdf.open(stream=response.content, filetype="pdf") as document:
+        native = next(info for info in document[0].get_image_info(xrefs=True) if info["xref"] == artwork_pdf["image"])
+        assert (native["width"], native["height"], native["colorspace"]) == (120, 60, 4)
+
+
+def test_swagger_docs_execute_interceptor_and_keep_two_file_contract(client):
+    response = client.get("/docs/")
+    assert response.status_code == 200
+    assert response.history[0].status_code == 307
+    html = response.text
+    assert "requestInterceptor: function preserveMultipartJson(request)" in html
+    schema = client.get("/openapi.json").json()
+    for endpoint in ("/api/nearest", "/api/predict"):
+        properties = schema["paths"][endpoint]["post"]["requestBody"]["content"]["multipart/form-data"]["schema"]["properties"]
+        assert {key for key, value in properties.items() if value.get("format") == "binary"} == {"pdf", "csv"}
+        assert properties["layers"]["type"] == "string"
+        assert properties["layers"]["example"] == '["Artwork"]'
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is required to execute the Swagger bootstrap regression")
+    inline = re.findall(r"<script>(.*?)</script>", html, re.S)
+    assert len(inline) == 1
+    bootstrap_test = """
+const assert = require('node:assert/strict');
+global.location = {href: 'http://localhost/docs'};
+let config, rawLayers, stateCalls = 0;
+const SwaggerUIBundle = options => {
+  config = options;
+  return {getSystem: () => ({oas3Selectors: {requestBodyValue: (path, method) => {
+    assert.ok(['/api/nearest', '/api/predict'].includes(path));
+    assert.equal(method, 'post');
+    stateCalls++;
+    return {getIn: keys => {assert.deepEqual(keys, ['layers', 'value']); return rawLayers;}};
+  }}})};
+};
+SwaggerUIBundle.presets = {apis: {}};
+SwaggerUIBundle.SwaggerUIStandalonePreset = {};
+""" + inline[0] + """
+assert.equal(typeof config.requestInterceptor, 'function');
+assert.equal(config.showMutatedRequest, true);
+for (const path of ['/api/nearest', '/api/predict']) {
+  for (const raw of ['["Artwork"]', '["Artwork","Technical"]', '["Print,Artwork","中文 [图层]"]']) {
+    rawLayers = raw;
+    const body = new FormData();
+    body.append('pdf', new Blob(['pdf']), 'source.pdf');
+    body.append('csv', new Blob(['csv']), 'colors.csv');
+    body.append('layers', JSON.parse(raw).join(','));
+    body.append('dpi', '  ');
+    const pdf = body.get('pdf'), csv = body.get('csv');
+    const request = {url: 'http://localhost' + path, body};
+    assert.equal(config.requestInterceptor(request), request);
+    assert.equal(body.get('layers'), raw);
+    assert.equal(body.has('dpi'), false);
+    assert.equal(body.get('pdf'), pdf);
+    assert.equal(body.get('csv'), csv);
+    assert.equal([...body.values()].filter(value => typeof value !== 'string').length, 2);
+    body.set('dpi', '72');
+    config.requestInterceptor(request);
+    assert.equal(body.get('dpi'), '72');
+  }
+}
+const callsBefore = stateCalls;
+const otherBody = new FormData(); otherBody.append('layers', 'unchanged'); otherBody.append('dpi', '');
+config.requestInterceptor({url: 'http://localhost/api/other', body: otherBody});
+assert.equal(otherBody.get('layers'), 'unchanged'); assert.equal(otherBody.has('dpi'), true);
+const jsonBody = {layers: 'unchanged'};
+config.requestInterceptor({url: 'http://localhost/api/nearest', body: jsonBody});
+config.requestInterceptor({url: 'http://localhost/openapi.json'});
+assert.equal(jsonBody.layers, 'unchanged'); assert.equal(stateCalls, callsBefore);
+"""
+    result = subprocess.run([node], input=bootstrap_test, capture_output=True, text=True,
+                            encoding="utf-8", timeout=15)
+    assert result.returncode == 0, result.stderr
 
 
 def test_validation_failure_releases_admission_slot(tmp_path, artwork_pdf):
