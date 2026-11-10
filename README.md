@@ -36,6 +36,10 @@ curl --fail http://127.0.0.1:5522/api/capabilities
 
 `deploy.sh` 构建镜像后等待 Docker 健康检查成功，`restart.sh` 不重新构建镜像。健康检查访问 `/api/ready`，GPU 检查会执行并同步 CUDA 内核。GPU 不可用时，生产接口返回 503，不会自动以 CPU 完成生产任务。
 
+数据默认写入仓库下的 `output/`，Docker 将其绑定到容器 `/data`。部署和重启脚本会准备该目录，用镜像内的 Python 临时以 root 初始化 `/data`、`jobs`、`tmp`、`cupy-cache` 四个顶层目录的权限，API 本身仍以 uid **10001** 运行；不会递归修改已有任务文件。脚本拒绝将仓库根、家目录、系统顶层目录、符号链接或含其他非 API 项目的目录用作输出目录。服务器无需另装 Python 或 jq。
+
+从旧命名卷配置升级时，旧 `runtime-data` 卷和原有 `runtime/` 目录不会自动搬迁或删除。新的 `output/` 不会自动显示旧目录/卷中的任务；如需迁移已有结果，应单独安排停服迁移。
+
 ## 本地测试网页
 
 先确保 `http://localhost:5522/api/ready` 返回成功，再在仓库根目录运行：
@@ -66,7 +70,7 @@ python -m demo.server
 
 成功响应为 `application/pdf`。没有 `quality` 或标注参数；处理精度固定为精细。其他图层保留，PDF 页数、方向和物理尺寸保持。
 
-需要 PDF 中存在真实 OCG 图层。没有图层、层名不存在或同一个名称对应多个图层时，接口会拒绝请求，避免误处理其他内容。
+需要 PDF 中存在真实 OCG 图层。没有图层或层名不存在时会拒绝请求；如果一个名称对应多个 OCG（例如多个 Print_Artwork），所有同名图层都会被选中，按各自图层 ID 逐一处理。共用的图像只换色一次，未选内容保持原样。
 
 ### GPU 找最接近
 
@@ -129,9 +133,13 @@ curl --fail -X POST http://127.0.0.1:5522/api/jobs/JOB_ID/cancel
 curl --fail -X DELETE http://127.0.0.1:5522/api/jobs/JOB_ID
 ```
 
-默认只使用一个 GPU 工作线程，其他任务排队，防止单张 3090 被并发模型占满显存。容器重建保留已完成结果；重启时尚未完成的任务会标记失败，需要重新提交。
+默认只使用一个 GPU 工作线程，其他任务排队，防止单张 3090 被并发模型占满显存。容器重建保留未过期的已完成结果；重启时尚未完成的任务会标记失败，需要重新提交。
 
-上传、结果和临时文件写到 Docker 命名卷 `runtime-data` 对应的 `/data`，不把整份上传 PDF 留在 Python 内存里。PDF 按块处理；单张原生嵌入图像或其重采样目标超过 6400 万像素时改走分块渲染，输出图像流逐块压缩。PDF 解码与解析仍会占用主机内存，实际可处理规模取决于稿件结构、RAM 和磁盘空间，不能用显存容量代替这些资源。
+裸机默认数据目录为仓库 `output/`；Compose 默认将同一个宿主目录绑定到容器 `/data`。可用 `CMYK_API_OUTPUT_DIR` 更改输出位置，裸机显式设置 `CMYK_API_WORK_DIR` 时优先使用该值。上传、结果、临时文件和 GPU 编译缓存都保存在输出目录，不把整份上传 PDF 留在 Python 内存里。该目录不会提交到 Git 或加入 Docker 构建上下文。
+
+任务完成后立即清理上传的 PDF、CSV 和中间文件，最终 PDF 从完成时间起保留 **24 小时**，下载不会延长保留期限。服务每 **1 小时**自动巡检，即使没有 API 请求也会清理到期结果；结果达到保留期限后在后续巡检中删除。临时文件及 GPU 编译缓存默认也按 **24 小时**期限清理。正在上传、排队、运行或下载的任务会受到保护，避免清理打断处理或下载。
+
+PDF 按块处理；单张原生嵌入图像或其重采样目标超过 6400 万像素时改走分块渲染，输出图像流逐块压缩。PDF 解码与解析仍会占用主机内存，实际可处理规模取决于稿件结构、RAM 和磁盘空间，不能用显存容量代替这些资源。
 
 默认上传 PDF 上限 64 GiB、CSV 上限 64 MiB，可在 `.env` 调整。PDF 路径使用 PyMuPDF 解码图像，不经过 Pillow，因此不受 Pillow 默认大图像素限制影响。pypdf 仅解析 PyMuPDF 已解压的绘制指令和字典，按需查询 PDF 对象，不用 `PdfReader` 将整份文件读入内存，也不走 pypdf 的图像解码流程。绘制指令的解析预算由默认 200 万提高到 **2000 万 token**，数组及字典限制提高到 **100 万项**；token 预算还可通过 `.env` 增大。上述预算约束指令复杂度，与 PDF 嵌入图像像素量不同。
 
@@ -145,11 +153,14 @@ curl --fail -X DELETE http://127.0.0.1:5522/api/jobs/JOB_ID
 | --- | --- | --- |
 | `BIND_HOST` | `0.0.0.0` | 宿主机监听地址；端口固定 5522 |
 | `GPU_DEVICE_ID` | `0` | 宿主机 GPU 编号或 UUID |
+| `CMYK_API_OUTPUT_DIR` | `./output` | 宿主机/裸机输出目录；Compose 将其绑定到 `/data` |
 | `CMYK_API_MAX_UPLOAD_GIB` | `64` | 单个 PDF 上传大小上限 |
 | `CMYK_API_MAX_CSV_MIB` | `64` | 单个 CSV 上传大小上限 |
 | `CMYK_API_UPLOAD_CHUNK_MIB` | `8` | 上传拷贝块大小 |
 | `CMYK_API_MAX_PENDING_JOBS` | `4` | 任务容量限制 |
-| `CMYK_API_JOB_TTL_HOURS` | `24` | 已结束任务保留时间；到期清理后无法下载 |
+| `CMYK_API_JOB_TTL_HOURS` | `24` | 最终 PDF 从任务完成时起的保留时间；到期清理后无法下载 |
+| `CMYK_API_CLEANUP_INTERVAL_SECONDS` | `3600` | 后台清理巡检间隔，无请求时也会执行 |
+| `CMYK_API_CACHE_TTL_HOURS` | `24` | 临时文件和 GPU 编译缓存的过期时间 |
 | `CMYK_PDF_NATIVE_MAX_PIXELS` | `64000000` | 单张原始图像或重采样目标的原生处理阈值，超过时使用分块渲染 |
 | `CMYK_PDF_PARSE_MAX_TOKENS` | `20000000` | 单个绘制内容流的 pypdf 解析 token 预算 |
 

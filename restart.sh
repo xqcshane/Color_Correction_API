@@ -17,6 +17,7 @@ if [[ ! "$timeout" =~ ^[1-9][0-9]*$ ]]; then
   printf 'HEALTH_TIMEOUT must be a positive integer.\n' >&2
   exit 2
 fi
+bash scripts/prepare-output.sh
 if ! docker compose up -d --no-build --force-recreate --wait --wait-timeout "$timeout" color-api; then
   docker compose logs --tail=100 color-api >&2
   printf 'Restart did not become ready. Check GPU / CUDA and the logs above.\n' >&2

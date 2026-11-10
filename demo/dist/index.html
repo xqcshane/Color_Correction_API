@@ -29,7 +29,7 @@
         <fieldset class="form-section output-section"><legend><span class="section-index">03</span>图层与输出</legend>
           <label class="field-label" for="layers">需要处理的图层 <span>每行一个名称</span></label>
           <textarea id="layers" rows="2" spellcheck="false" placeholder="Print_Artwork">Print_Artwork</textarea>
-          <p class="field-hint">名称需与 PDF 图层完全一致，未选图层保留。</p>
+          <p class="field-hint">名称精确匹配，同名图层全部处理，未选图层保留。</p>
           <div class="density-row"><div><label class="field-label" for="densityMode">输出密度</label><select id="densityMode"><option value="original">保留原稿密度</option><option value="custom">自定义 DPI</option></select></div><div class="dpi-field"><label class="field-label" for="dpi">DPI</label><input id="dpi" type="number" inputmode="decimal" min="0.1" step="0.1" value="304.8" disabled></div></div>
           <p id="densityHint" class="field-hint">保持原稿像素密度与页面物理尺寸。</p>
         </fieldset>

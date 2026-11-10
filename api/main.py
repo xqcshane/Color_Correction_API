@@ -24,6 +24,7 @@ from .config import Settings
 from .csv_input import parse_pairs_csv
 from .docs_ui import swagger_docs_html
 from .jobs import JobManager, JobRecord
+from .lifecycle import LeasedFileResponse, maintenance_loop, upload_temporary_directory
 from .pdf_engine import inspect_pdf
 from .processor import process_job
 
@@ -82,9 +83,8 @@ def _resolve_pdf_options(metadata: dict, names: list[str], dpi: float | None) ->
         ids = available.get(name, [])
         if not ids:
             raise ValueError(f"找不到图层 {name!r}；可用层名：{list(available)}")
-        if len(ids) != 1:
-            raise ValueError(f"层名 {name!r} 重复，无法唯一选择；请在 PDF 中改为唯一名称")
         selected.extend(ids)
+    selected = list(dict.fromkeys(selected))
     actual_dpi = dpi if dpi is not None else metadata.get("detectedDpi")
     if actual_dpi is None or not math.isfinite(float(actual_dpi)) or float(actual_dpi) <= 0:
         raise ValueError("无法确定原稿密度（例如纯矢量 PDF），请显式设置 dpi")
@@ -98,17 +98,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     cache = Path(os.getenv("CUPY_CACHE_DIR", str(settings.work_dir / "cupy-cache")))
     cache.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("CUPY_CACHE_DIR", str(cache))
-    jobs = JobManager(settings.work_dir, worker_count=1)
+    temp_dir = settings.work_dir / "tmp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    jobs = JobManager(settings.work_dir, worker_count=1, retention_hours=settings.job_ttl_hours)
     slots = threading.BoundedSemaphore(settings.max_pending_jobs)
 
     @asynccontextmanager
     async def lifespan(app):
-        app.state.compute = await run_in_threadpool(detect_capabilities, settings.force_cpu)
-        yield
-        jobs.shutdown()
+        stop = asyncio.Event()
+        cleanup_task = None
+        try:
+            with upload_temporary_directory(temp_dir):
+                app.state.compute = await run_in_threadpool(detect_capabilities, settings.force_cpu)
+                cleanup_task = asyncio.create_task(maintenance_loop(
+                    jobs, cache_dir=cache, temp_dir=temp_dir,
+                    cache_ttl_hours=settings.cache_ttl_hours,
+                    interval_seconds=settings.cleanup_interval_seconds, stop=stop,
+                ))
+                try:
+                    yield
+                finally:
+                    stop.set()
+                    await cleanup_task
+        finally:
+            jobs.shutdown()
 
     app = FastAPI(title="Color Correction API", version=__version__, lifespan=lifespan,
-                  docs_url=None, openapi_url="/openapi.json")
+                  docs_url=None, openapi_url="/openapi.json",
+                  openapi_tags=[
+                      {"name": "GPU 找最接近", "description": "按实测色块匹配 CMYK，输入 PDF、CSV、图层名及可选 DPI，输出 PDF。"},
+                      {"name": "GPU 推算新色", "description": "根据 CMYK–Lab 数据推算新配方，输入 PDF、CSV、图层名及可选 DPI，输出 PDF。"},
+                      {"name": "服务状态", "description": "服务健康、GPU 就绪状态与处理能力。"},
+                      {"name": "任务管理", "description": "查询进度、下载结果、取消或删除异步任务。"},
+                  ])
     app.state.settings, app.state.jobs = settings, jobs
     app.add_middleware(BodyLimitMiddleware,
                        max_bytes=settings.max_upload_bytes + settings.max_csv_bytes + 1024**2)
@@ -142,28 +164,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(404, "任务不存在或已过保留期") from exc
 
     def result_response(record: JobRecord) -> FileResponse:
-        if record.status != "succeeded" or not record.result_pdf.is_file():
-            raise HTTPException(409, {"status": record.status, "error": record.error})
-        stem = re.sub(r"[^A-Za-z0-9._\-\u4e00-\u9fff]+", "_", Path(record.original_filename).stem)[:120] or "result"
-        return FileResponse(record.result_pdf, media_type="application/pdf",
-                            filename=f"{stem}-{record.options.get('method', 'processed')}-CMYK.pdf",
-                            headers={"X-Job-ID": record.id})
+        try:
+            lease = jobs.pin(record.id)
+        except KeyError as exc:
+            raise HTTPException(404, "任务不存在或已过保留期") from exc
+        record = lease.record
+        try:
+            if record.status != "succeeded" or not record.result_pdf.is_file():
+                raise HTTPException(409, {"status": record.status, "error": record.error})
+            stem = re.sub(r"[^A-Za-z0-9._\-\u4e00-\u9fff]+", "_", Path(record.original_filename).stem)[:120] or "result"
+            return LeasedFileResponse(record.result_pdf, media_type="application/pdf",
+                                      filename=f"{stem}-{record.options.get('method', 'processed')}-CMYK.pdf",
+                                      headers={"X-Job-ID": record.id}, lease=lease)
+        except BaseException:
+            lease.release()
+            raise
 
-    @app.get("/api/health")
+    @app.get("/api/health", tags=["服务状态"])
     def health():
         info = compute()
         return {"ok": True, "service": "color-correction-api", "version": __version__,
                 "gpuReady": info.gpu_available, "gpuName": info.gpu_name,
                 "backend": "cupy" if info.gpu_available else "numpy"}
 
-    @app.get("/api/ready")
+    @app.get("/api/ready", tags=["服务状态"])
     def ready():
         require_gpu()
         return health()
 
-    @app.get("/api/capabilities")
+    @app.get("/api/capabilities", tags=["服务状态"])
     def capabilities():
         return {**health(), "compute": compute().to_dict(), "quality": "fine",
+                "storage": {"jobRetentionHours": settings.job_ttl_hours,
+                            "cacheRetentionHours": settings.cache_ttl_hours,
+                            "cleanupIntervalSeconds": settings.cleanup_interval_seconds},
                 "limits": {"maxUploadBytes": settings.max_upload_bytes,
                            "maxCsvBytes": settings.max_csv_bytes,
                            "maxPendingJobs": settings.max_pending_jobs,
@@ -176,7 +210,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "pdf": {"type": "string", "format": "binary"},
             "csv": {"type": "string", "format": "binary"},
             "layers": {"type": "string", "example": '["Artwork"]',
-                       "description": '需处理的层名 JSON 数组，例如 ["Artwork"]'},
+                       "description": '需处理的层名 JSON 数组，例如 ["Artwork"]；同名图层将全部处理'},
             "dpi": {"type": "number", "exclusiveMinimum": 0,
                     "description": "可选输出 DPI；省略或留空即保持原稿密度"}
         }}}}}}
@@ -187,9 +221,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         require_gpu()
         if not slots.acquire(blocking=False):
             raise HTTPException(429, "任务队列已满，请稍后重试", headers={"Retry-After": "10"})
+        upload_lease = None
         record = None
         submitted = False
         try:
+            upload_lease = await run_in_threadpool(jobs.begin_upload)
             async with request.form(max_files=2, max_fields=2, max_part_size=64 * 1024) as form:
                 if set(form.keys()) - {"pdf", "csv", "layers", "dpi"}:
                     raise HTTPException(422, "仅支持 pdf、csv、layers、dpi 字段")
@@ -220,6 +256,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 pdf_options = _resolve_pdf_options(metadata, names, dpi)
             except (ValueError, RuntimeError) as exc:
                 raise HTTPException(422, str(exc)) from exc
+            # Uploading the body is only the first phase. A client can abort
+            # while CSV/PDF inspection runs, before it receives a job ID.
+            # Do not enqueue GPU work that this client can no longer manage.
+            if await request.is_disconnected():
+                raise HTTPException(499, "客户端断开，任务未进入 GPU 队列")
             jobs.update(record.id, options={"method": method, "quality": "fine", "points": points,
                                            "forceCpu": settings.force_cpu, "pdf": pdf_options},
                         input_bytes=input_size)
@@ -238,8 +279,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await asyncio.sleep(0.2)
             if record.status != "succeeded":
                 raise HTTPException(422, {"job_id": record.id, "status": record.status, "error": record.error})
-            return result_response(record)
+            return await run_in_threadpool(result_response, record)
         finally:
+            if upload_lease is not None:
+                upload_lease.release()
             if not submitted:
                 slots.release()
                 if record is not None:
@@ -247,28 +290,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     jobs.delete(record.id)
 
     @app.post("/api/nearest", openapi_extra=multipart_schema, responses=pdf_responses,
-              summary="GPU 找最接近", response_class=FileResponse)
+              summary="GPU 找最接近", tags=["GPU 找最接近"], response_class=FileResponse)
     async def nearest(request: Request, wait: bool = Query(True, description="false 返回异步任务（适合大 PDF）")):
         return await convert(request, "nearest", wait)
 
     @app.post("/api/predict", openapi_extra=multipart_schema, responses=pdf_responses,
-              summary="GPU 推算新色", response_class=FileResponse)
+              summary="GPU 推算新色", tags=["GPU 推算新色"], response_class=FileResponse)
     async def predict(request: Request, wait: bool = Query(True, description="false 返回异步任务（适合大 PDF）")):
         return await convert(request, "model", wait)
 
-    @app.get("/api/jobs/{job_id}")
+    @app.get("/api/jobs/{job_id}", tags=["任务管理"])
     def get_job(job_id: str):
         return require_job(job_id).public_dict()
 
-    @app.get("/api/jobs/{job_id}/result")
+    @app.get("/api/jobs/{job_id}/result", tags=["任务管理"])
     def get_result(job_id: str):
         return result_response(require_job(job_id))
 
-    @app.post("/api/jobs/{job_id}/cancel", status_code=202)
+    @app.post("/api/jobs/{job_id}/cancel", status_code=202, tags=["任务管理"])
     def cancel_job(job_id: str):
         return jobs.cancel(require_job(job_id).id).public_dict()
 
-    @app.delete("/api/jobs/{job_id}")
+    @app.delete("/api/jobs/{job_id}", tags=["任务管理"])
     def delete_job(job_id: str):
         try:
             jobs.delete(require_job(job_id).id)

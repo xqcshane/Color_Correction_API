@@ -18,7 +18,7 @@ python -m demo.server --api-base-url http://localhost:5522 --port 5533
 
 也可以用环境变量 `API_BASE_URL` 设置默认 API 地址；命令行参数优先。默认只监听本机 `127.0.0.1`，需要改变监听地址时使用 `--host`。`GET /demo-config` 返回网页显示使用的 `apiBaseUrl`。
 
-网页需要 PDF、同一测量组的 CMYK–Lab CSV 和准确的 PDF 图层名称。当前 API 没有检查图层列表的接口，图层名称需要手工输入。省略输出 DPI 就保留原稿密度；无法检测密度的纯矢量稿件需要手动指定 DPI。
+网页需要 PDF、同一测量组的 CMYK–Lab CSV 和准确的 PDF 图层名称。当前 API 没有检查图层列表的接口，图层名称需要手工输入；如果名称在 PDF 中重复，所有同名图层都会处理。省略输出 DPI 就保留原稿密度；无法检测密度的纯矢量稿件需要手动指定 DPI。
 
 预览由本地 PDF.js **6.5.438** 渲染到 canvas，主模块、worker 和许可证位于 `demo/dist/vendor`，不依赖 CDN。页面只绘制 PDF 第 1 页；超过 **80 MiB** 的原稿或结果需点击“加载 PDF 预览”后才读取预览。
 

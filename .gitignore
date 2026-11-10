@@ -5,6 +5,7 @@ __pycache__/
 .coverage
 htmlcov/
 runtime/
+output/
 api/runtime/
 reference_tests/
 .env

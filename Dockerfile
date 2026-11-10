@@ -10,12 +10,15 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_PATH=/usr/local/cuda \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     CMYK_API_WORK_DIR=/data \
+    CMYK_API_JOB_TTL_HOURS=24 \
+    CMYK_API_CLEANUP_INTERVAL_SECONDS=3600 \
+    CMYK_API_CACHE_TTL_HOURS=24 \
     CUPY_CACHE_DIR=/data/cupy-cache \
     TMPDIR=/data/tmp
 
 # Use authenticated Ubuntu mirrors and avoid stale proxy indexes during mirror sync.
 # Keep by-hash optional for third-party repositories that do not support it.
-RUN mkdir -p /data/tmp /data/cupy-cache \
+RUN mkdir -p /data/jobs /data/tmp /data/cupy-cache \
     && find /etc/apt -maxdepth 2 -type f \( -name '*.list' -o -name '*.sources' \) \
       -exec sed -i \
         -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
@@ -43,7 +46,7 @@ COPY api /app/api
 COPY scripts /app/scripts
 RUN groupadd --gid 10001 colorapi \
     && useradd --uid 10001 --gid colorapi --no-create-home colorapi \
-    && chown -R colorapi:colorapi /data
+    && chown colorapi:colorapi /data /data/jobs /data/tmp /data/cupy-cache
 
 USER colorapi
 EXPOSE 5522

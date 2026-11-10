@@ -9,6 +9,7 @@ import subprocess
 import threading
 import time
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from fastapi.testclient import TestClient
 import numpy as np
@@ -324,25 +325,76 @@ def test_running_job_cancel_is_cooperative(tmp_path, monkeypatch, artwork_pdf):
         assert client.delete(f"/api/jobs/{job_id}").status_code == 200
 
 
-def test_disconnected_sync_client_requests_job_cancellation(tmp_path, monkeypatch, artwork_pdf):
+@pytest.mark.parametrize("wait", [True, False])
+def test_disconnect_during_inspection_never_submits_and_releases_slot(tmp_path, monkeypatch, artwork_pdf, wait):
     import api.main
     from starlette.requests import Request
 
+    inspected = threading.Event()
+    disconnected_client = {"value": True}
+    real_inspect = api.main.inspect_pdf
+    real_processor = api.main.process_job
+
+    def inspect_then_disconnect(path):
+        metadata = real_inspect(path)
+        inspected.set()
+        return metadata
+
     async def disconnected(_request):
-        return True
+        # Simulate an abort after the body has been saved and its PDF checked,
+        # matching the demo's wait=false upload/inspection phase.
+        assert inspected.is_set()
+        return disconnected_client["value"]
 
-    def wait_for_cancellation(context):
-        for _ in range(200):
-            context.check_cancelled()
-            time.sleep(.01)
-        raise RuntimeError("disconnect did not cancel the task")
-
+    processor = Mock(side_effect=AssertionError("disconnected upload reached GPU processing"))
+    monkeypatch.setattr(api.main, "inspect_pdf", inspect_then_disconnect)
     monkeypatch.setattr(Request, "is_disconnected", disconnected)
-    monkeypatch.setattr(api.main, "process_job", wait_for_cancellation)
+    monkeypatch.setattr(api.main, "process_job", processor)
     app = create_app(Settings(work_dir=tmp_path / "disconnect", force_cpu=True, max_pending_jobs=1))
+    submit = Mock(wraps=app.state.jobs.submit)
+    monkeypatch.setattr(app.state.jobs, "submit", submit)
     with TestClient(app) as client:
-        response = post_pdf(client, artwork_pdf["bytes"])
+        response = post_pdf(client, artwork_pdf["bytes"], wait=wait)
         assert response.status_code == 499, response.text
-        records = app.state.jobs.list()
-        assert len(records) == 1
-        assert await_terminal(client, records[0].id)["status"] == "cancelled"
+        assert inspected.is_set()
+        submit.assert_not_called()
+        processor.assert_not_called()
+        assert app.state.jobs.list() == []
+        assert list(app.state.settings.work_dir.joinpath("jobs").iterdir()) == []
+
+        # A valid second request on the only admission slot must still enter
+        # the queue and produce a PDF, rather than leaking a permanent 429.
+        disconnected_client["value"] = False
+        monkeypatch.setattr(api.main, "process_job", real_processor)
+        accepted = post_pdf(client, artwork_pdf["bytes"], wait=False)
+        assert accepted.status_code == 202, accepted.text
+        submit.assert_called_once()
+        finished = await_terminal(client, accepted.json()["id"])
+        assert finished["status"] == "succeeded", finished
+
+
+def test_matching_layer_name_selects_every_ocg_with_that_name(client, artwork_pdf):
+    with pymupdf.open(stream=artwork_pdf["bytes"], filetype="pdf") as document:
+        duplicate = document.add_ocg("Artwork", on=True, usage="Artwork")
+        pixels = bytes((10, 90, 200)) * (60 * 60)
+        image = pymupdf.Pixmap(pymupdf.csRGB, 60, 60, pixels, False)
+        added_image = document[0].insert_image(pymupdf.Rect(60, 30, 120, 90), pixmap=image, oc=duplicate)
+        source = document.tobytes()
+    response = post_pdf(client, source)
+    assert response.status_code == 200, response.text
+    record = client.app.state.jobs.require(response.headers["x-job-id"])
+    assert set(record.options["pdf"]["processedLayerIds"]) == {str(artwork_pdf["artwork"]), str(duplicate)}
+    with pymupdf.open(stream=response.content, filetype="pdf") as output:
+        for xref in (artwork_pdf["image"], added_image):
+            assert output.xref_get_key(xref, "ColorSpace") == ("name", "/DeviceCMYK")
+        assert all(output.get_ocgs()[xref]["on"] for xref in (artwork_pdf["artwork"], duplicate))
+        assert artwork_pdf["technical_stream"] in [output.xref_stream(xref) for xref in output[0].get_contents()]
+
+
+def test_swagger_tags_separate_both_algorithms_and_utility_endpoints(client):
+    schema = client.get("/openapi.json").json()
+    assert schema["paths"]["/api/nearest"]["post"]["tags"] == ["GPU 找最接近"]
+    assert schema["paths"]["/api/predict"]["post"]["tags"] == ["GPU 推算新色"]
+    assert schema["paths"]["/api/health"]["get"]["tags"] == ["服务状态"]
+    assert schema["paths"]["/api/jobs/{job_id}"]["get"]["tags"] == ["任务管理"]
+    assert {tag["name"] for tag in schema["tags"]} == {"GPU 找最接近", "GPU 推算新色", "服务状态", "任务管理"}

@@ -397,109 +397,184 @@ def _bbox_close(first: Any, second: Any, tolerance: float = 0.25) -> bool:
         return False
 
 
-def _discover_direct_layer_images(document: Any) -> dict[int, list[LayerImage] | None]:
-    """Return native image replacements for image-only OCGs.
+@dataclass(frozen=True)
+class _PaintEvent:
+    kind: str
+    layer_xrefs: frozenset[int]
+    image_xref: int = 0
+    exact_layer: bool = True
+    width_pt: float = 0.0
+    height_pt: float = 0.0
 
-    ``get_bboxlog(layers=True)`` is the only high-level API that reports the
-    effective OCG name for images inside Form XObjects. MuPDF reports image
-    paint operations in the same display order as ``get_image_info``; bbox
-    matching is still required so a future ordering change fails closed.
+
+class _PdfPaintScanner:
+    """Trace paint ownership using PDF references, never display layer names.
+
+    MuPDF's bbox log only reports names, which are not unique PDF identifiers.
+    Parsing the small content streams also avoids hashing/decoding every image
+    merely to discover its xref.
     """
 
-    ocgs = document.get_ocgs() or {}
-    name_to_xrefs: dict[str, list[int]] = {}
-    for xref, detail in ocgs.items():
-        name_to_xrefs.setdefault(str(detail.get("name") or ""), []).append(int(xref))
-    layer_images: dict[int, list[LayerImage] | None] = {int(xref): [] for xref in ocgs}
-    xref_layers: dict[int, set[int]] = {}
+    strict = True
+
+    def __init__(self, document: Any):
+        self.document = document
+        self.ocgs = document.get_ocgs() or {}
+        self.objects: dict[int, Any] = {}
+        self.visiting: set[int] = set()
+
+    def get_object(self, reference):
+        from pypdf.generic import read_object
+
+        xref = reference if isinstance(reference, int) else reference.idnum
+        if xref not in self.objects:
+            with _pdf_parse_configuration():
+                self.objects[xref] = read_object(BytesIO(self.document.xref_object(xref, compressed=False).encode("utf-8")), self)
+        return self.objects[xref]
+
+    def dictionary(self, value):
+        from pypdf.generic import DictionaryObject, IndirectObject
+
+        if isinstance(value, IndirectObject):
+            value = self.get_object(value)
+        return value if isinstance(value, DictionaryObject) else DictionaryObject()
+
+    def page_resources(self, page):
+        from pypdf.generic import IndirectObject
+
+        owner = page.xref
+        visited: set[int] = set()
+        while owner and owner not in visited:
+            visited.add(owner)
+            detail = self.dictionary(self.get_object(owner))
+            if "/Resources" in detail:
+                return self.dictionary(detail.get("/Resources"))
+            parent = detail.get("/Parent")
+            owner = parent.idnum if isinstance(parent, IndirectObject) else 0
+        return self.dictionary(None)
+
+    def operations(self, data: bytes):
+        from pypdf.generic import ContentStream, DecodedStreamObject
+
+        stream = DecodedStreamObject()
+        stream.set_data(data)
+        with _pdf_parse_configuration():
+            return ContentStream(stream, self).operations
+
+    def optional_groups(self, value) -> tuple[frozenset[int], bool]:
+        from pypdf.generic import ArrayObject, IndirectObject, NullObject
+
+        if value is None or isinstance(value, NullObject):
+            return frozenset(), True
+        if isinstance(value, IndirectObject) and value.idnum in self.ocgs:
+            return frozenset({value.idnum}), True
+        detail = self.dictionary(value)
+        groups = detail.get("/OCGs")
+        groups = groups if isinstance(groups, ArrayObject) else [groups] if groups else []
+        refs = {group.idnum for group in groups if isinstance(group, IndirectObject) and group.idnum in self.ocgs}
+        # OCMD visibility policies and nested combinations require the safe
+        # rendering path; they cannot be assigned to one image-only OCG.
+        return frozenset(refs), False
+
+    def trace(self, data: bytes, resources, inherited: frozenset[int] = frozenset(), inherited_exact: bool = True, matrix=None) -> list[_PaintEvent]:
+        from pypdf.generic import IndirectObject, NameObject
+
+        resources = self.dictionary(resources)
+        properties = self.dictionary(resources.get("/Properties"))
+        xobjects = self.dictionary(resources.get("/XObject"))
+        groups, exact = inherited, inherited_exact
+        pymupdf = _pymupdf()
+        matrix = pymupdf.Matrix(matrix) if matrix is not None else pymupdf.Matrix(1, 1)
+        matrix_stack = []
+        stack: list[tuple[frozenset[int], bool]] = []
+        events = []
+        for operands, operator in self.operations(data):
+            if operator == b"q":
+                matrix_stack.append(pymupdf.Matrix(matrix))
+            elif operator == b"Q":
+                if not matrix_stack:
+                    raise PdfEngineError("PDF 图形状态栈不匹配")
+                matrix = matrix_stack.pop()
+            elif operator == b"cm":
+                matrix = pymupdf.Matrix(*map(float, operands)) * matrix
+            elif operator in {b"BDC", b"BMC"}:
+                stack.append((groups, exact))
+                if operator == b"BDC" and operands and str(operands[0]) == "/OC":
+                    value = operands[1]
+                    if isinstance(value, NameObject):
+                        value = properties.get(value)
+                    owned, known = self.optional_groups(value)
+                    groups, exact = groups | owned, exact and known
+            elif operator == b"EMC":
+                if not stack:
+                    raise PdfEngineError("PDF 标记内容栈不匹配")
+                groups, exact = stack.pop()
+            elif operator == b"Do":
+                reference = xobjects.get(operands[0])
+                if not isinstance(reference, IndirectObject):
+                    raise PdfEngineError("PDF XObject 引用无效")
+                obj = self.dictionary(reference)
+                owned, known = self.optional_groups(obj.get("/OC")) if obj.get("/OC") else (frozenset(), True)
+                paint_groups, paint_exact = groups | owned, exact and known
+                if obj.get("/Subtype") == "/Form":
+                    if reference.idnum in self.visiting:
+                        raise PdfEngineError("PDF Form XObject 存在递归引用")
+                    self.visiting.add(reference.idnum)
+                    try:
+                        child_matrix = pymupdf.Matrix(*map(float, obj.get("/Matrix", [1, 0, 0, 1, 0, 0]))) * matrix
+                        events.extend(self.trace(self.document.xref_stream(reference.idnum), obj.get("/Resources", resources), paint_groups, paint_exact, child_matrix))
+                    finally:
+                        self.visiting.remove(reference.idnum)
+                else:
+                    events.append(_PaintEvent("image", paint_groups or frozenset({0}), reference.idnum, paint_exact, math.hypot(matrix.a, matrix.b), math.hypot(matrix.c, matrix.d)))
+            elif operator in {b"S", b"s", b"f", b"F", b"f*", b"B", b"B*", b"b", b"b*", b"Tj", b"TJ", b"'", b'"', b"sh", b"INLINE IMAGE"}:
+                events.append(_PaintEvent("other", groups or frozenset({0}), exact_layer=exact))
+        if stack or matrix_stack:
+            raise PdfEngineError("PDF 标记内容栈不匹配")
+        return events
+
+
+def _discover_direct_layer_images(document: Any, selected_layer_xrefs: Iterable[int] | None = None) -> dict[int, list[LayerImage] | None]:
+    scanner = _PdfPaintScanner(document)
+    selected = set(selected_layer_xrefs) if selected_layer_xrefs is not None else None
+    layer_images: dict[int, list[LayerImage] | None] = {int(xref): [] for xref in scanner.ocgs}
+    image_owners: dict[int, set[int]] = {}
     unsafe_layers: set[int] = set()
-
-    for page_index in range(document.page_count):
-        page = document.load_page(page_index)
-        try:
-            logs = list(page.get_bboxlog(layers=True))
-        except TypeError:
-            return {int(xref): None for xref in ocgs}
-        image_logs = [entry for entry in logs if entry and str(entry[0]) == "fill-image"]
-        infos = list(page.get_image_info(hashes=False, xrefs=True))
-        image_table = {int(item[0]): int(item[1] or 0) for item in page.get_images(full=True)}
-        used_logs: set[int] = set()
-        layer_content_kinds: dict[int, set[str]] = {}
-
-        for entry in logs:
-            if len(entry) < 3:
+    for page_index, page in enumerate(document):
+        data = b"\n".join(document.xref_stream(xref) for xref in page.get_contents())
+        for event in scanner.trace(data, scanner.page_resources(page), matrix=page.transformation_matrix):
+            assignable = len(event.layer_xrefs) == 1 or (selected is not None and event.layer_xrefs <= selected)
+            if event.kind != "image" or not event.exact_layer or not assignable:
+                unsafe_layers.update(event.layer_xrefs)
+            if event.kind != "image":
                 continue
-            layer_name = str(entry[2] or "")
-            candidates = name_to_xrefs.get(layer_name, [])
-            if len(candidates) == 1:
-                layer_content_kinds.setdefault(candidates[0], set()).add(str(entry[0]))
-
-        for info in infos:
-            bbox = info.get("bbox")
-            matched_index = next(
-                (
-                    index
-                    for index, entry in enumerate(image_logs)
-                    if index not in used_logs
-                    and len(entry) >= 3
-                    and _bbox_close(entry[1], bbox)
-                ),
-                None,
-            )
-            xref = int(info.get("xref") or 0)
-            if not xref or matched_index is None:
-                if xref:
-                    xref_layers.setdefault(xref, set()).add(0)
+            image_owners.setdefault(event.image_xref, set()).update(event.layer_xrefs)
+            if not assignable or not event.exact_layer:
                 continue
-            used_logs.add(matched_index)
-            layer_name = str(image_logs[matched_index][2] or "")
-            layer_candidates = name_to_xrefs.get(layer_name, [])
-            oc_xref = int(document.get_oc(xref) or 0)
-            if oc_xref in ocgs:
-                layer_xref = oc_xref
-            elif len(layer_candidates) == 1:
-                layer_xref = layer_candidates[0]
-            else:
-                # Replacing an image shared with unlayered/ambiguous content
-                # would also recolour content outside the requested layer.
-                xref_layers.setdefault(xref, set()).add(0)
-                continue
-            image_mask_type, image_mask_value = document.xref_get_key(xref, "ImageMask")
-            mask_type, _ = document.xref_get_key(xref, "Mask")
-            if (
-                (image_mask_type == "bool" and image_mask_value == "true")
-                or mask_type not in {"null", "unknown"}
-            ):
-                unsafe_layers.add(layer_xref)
-            layer_images[layer_xref].append(
-                LayerImage(
-                    xref=xref,
-                    smask=image_table.get(xref, 0),
-                    width=int(info.get("width") or 0),
-                    height=int(info.get("height") or 0),
-                    page_index=page_index,
-                    layer_xref=layer_xref,
-                    layer_name=layer_name or str(ocgs[layer_xref].get("name") or layer_xref),
-                    oc_xref=oc_xref,
-                )
-            )
-            xref_layers.setdefault(xref, set()).add(layer_xref)
-
-        for layer_xref, kinds in layer_content_kinds.items():
-            if any(kind != "fill-image" for kind in kinds):
-                layer_images[layer_xref] = None
-
+            obj = scanner.dictionary(scanner.get_object(event.image_xref))
+            for layer_xref in event.layer_xrefs:
+                if layer_xref not in layer_images:
+                    continue
+                if bool(obj.get("/ImageMask")) or obj.get("/Mask"):
+                    unsafe_layers.add(layer_xref)
+                mask = obj.get("/SMask")
+                layer_images[layer_xref].append(LayerImage(
+                    xref=event.image_xref,
+                    smask=int(mask.idnum) if hasattr(mask, "idnum") else 0,
+                    width=int(obj.get("/Width") or 0), height=int(obj.get("/Height") or 0),
+                    page_index=page_index, layer_xref=layer_xref,
+                    layer_name=str(scanner.ocgs[layer_xref].get("name") or layer_xref),
+                    oc_xref=int(document.get_oc(event.image_xref) or 0),
+                ))
     for layer_xref, images in list(layer_images.items()):
-        if images is None or layer_xref in unsafe_layers:
-            layer_images[layer_xref] = None
-            continue
-        deduplicated: dict[int, LayerImage] = {}
-        for image in images:
-            deduplicated.setdefault(image.xref, image)
-        if any(len(xref_layers.get(xref, ())) != 1 for xref in deduplicated):
-            layer_images[layer_xref] = None
-        else:
-            layer_images[layer_xref] = list(deduplicated.values())
+        unique = {image.xref: image for image in images or ()}
+        layer_images[layer_xref] = (
+            None if layer_xref in unsafe_layers or any(
+                image_owners[xref] != {layer_xref} and not (selected is not None and image_owners[xref] <= selected)
+                for xref in unique
+            )
+            else list(unique.values())
+        )
     return layer_images
 
 
@@ -803,7 +878,9 @@ def _replace_native_layer_images(
 ) -> dict[int, list[int]]:
     if any(not direct_layers.get(layer_xref) for layer_xref in selected):
         raise PdfEngineError("所选图层不能使用原生图像替换")
-    images = [image for layer_xref in selected for image in direct_layers[layer_xref] or ()]
+    # A raster reused by several selected OCGs has one shared stream. Convert
+    # that stream once, retaining each layer's reference to the same xref.
+    images = list({image.xref: image for layer_xref in selected for image in direct_layers[layer_xref] or ()}.values())
     target_sizes = target_sizes or {}
     total_tasks = sum(
         math.ceil(target_sizes.get(image.xref, (image.width, image.height))[0] / tile_size)
@@ -811,7 +888,10 @@ def _replace_native_layer_images(
         for image in images
     )
     completed = 0
-    replacements: dict[int, list[int]] = {layer_xref: [] for layer_xref in selected}
+    replacements: dict[int, list[int]] = {
+        layer_xref: [image.xref for image in direct_layers[layer_xref] or ()]
+        for layer_xref in selected
+    }
     for image in images:
         _check_cancelled(cancelled)
         image_tasks = _process_native_image(
@@ -828,7 +908,6 @@ def _replace_native_layer_images(
             target_size=target_sizes.get(image.xref),
             resampled_masks=resampled_masks,
         )
-        replacements[image.layer_xref].append(image.xref)
         completed += image_tasks
     return replacements
 
@@ -841,17 +920,17 @@ def _native_resample_sizes(document: Any, images: Sequence[LayerImage], dpi: flo
     placement and misrepresent the density of every smaller placement.
     """
     sizes: dict[int, set[tuple[int, int]]] = {image.xref: set() for image in images}
+    scanner = _PdfPaintScanner(document)
     for page in document:
-        for info in page.get_image_info(xrefs=True):
-            image_xref = int(info.get("xref") or 0)
+        data = b"\n".join(document.xref_stream(xref) for xref in page.get_contents())
+        for event in scanner.trace(data, scanner.page_resources(page), matrix=page.transformation_matrix):
+            image_xref = event.image_xref
             if image_xref not in sizes:
                 continue
-            transform = info.get("transform")
-            if not transform or len(transform) < 4:
+            if event.width_pt <= 0 or event.height_pt <= 0:
                 raise PdfEngineError("无法确定嵌入图像的实际放置尺寸，请重新导出 PDF")
-            a, b, c, d = map(float, transform[:4])
-            width = max(1, round(math.hypot(a, b) * dpi / POINTS_PER_INCH))
-            height = max(1, round(math.hypot(c, d) * dpi / POINTS_PER_INCH))
+            width = max(1, round(event.width_pt * dpi / POINTS_PER_INCH))
+            height = max(1, round(event.height_pt * dpi / POINTS_PER_INCH))
             sizes[image_xref].add((width, height))
     result: dict[int, tuple[int, int]] = {}
     for image in images:
@@ -1028,6 +1107,10 @@ def _isolate_render_layer(document: Any, selected_xref: int) -> None:
 
     def oc_state(value) -> tuple[bool, bool]:
         """Return visible-with-selected-only, references-selected."""
+        from pypdf.generic import NullObject
+
+        if value is None or isinstance(value, NullObject):
+            return True, False
         if isinstance(value, IndirectObject):
             if value.idnum in (document.get_ocgs() or {}):
                 return value.idnum == selected_xref, value.idnum == selected_xref
@@ -1188,87 +1271,43 @@ def _isolate_render_layer(document: Any, selected_xref: int) -> None:
 
 
 def _overlay_insertion_anchors(document: Any, selected: Sequence[int]) -> dict[tuple[int, int], int | None]:
-    """Locate safe stream boundaries that preserve each layer's paint order.
-
-    Whole-layer rasterisation cannot preserve interleaved paint operations.
-    Reject those layouts instead of silently moving selected artwork below
-    backgrounds or above technical lines. Native image replacement does not
-    need this restriction.
-    """
-    from pypdf.generic import ContentStream, DecodedStreamObject
-
-    pymupdf = _pymupdf()
+    """Find safe boundaries by OCG xref, including non-unique layer names."""
+    scanner = _PdfPaintScanner(document)
     anchors: dict[tuple[int, int], int | None] = {}
-    with pymupdf.open(document.name) as scan:
-        ocgs = scan.get_ocgs() or {}
-        names = {xref: str(ocgs[xref].get("name") or "") for xref in selected}
-        for config in scan.layer_ui_configs():
-            if config.get("type") != "label":
-                scan.set_layer_ui_config(config["number"], action=0)
-        def paint_names(page):
-            entries = list(page.get_bboxlog(layers=True))
-            images = list(page.get_image_info(xrefs=True))
-            used: set[int] = set()
-            result = []
-            for entry in entries:
-                if len(entry) < 3 or entry[0] == "ignore-text":
-                    continue
-                name = str(entry[2] or "")
-                if entry[0] == "fill-image":
-                    match = next((index for index, image in enumerate(images) if index not in used and _bbox_close(entry[1], image.get("bbox"))), None)
-                    if match is not None:
-                        used.add(match)
-                        image_xref = int(images[match].get("xref") or 0)
-                        attached = int(scan.get_oc(image_xref) or 0) if image_xref else 0
-                        if attached in ocgs:
-                            name = str(ocgs[attached].get("name") or "")
-                result.append(name)
-            return result
-        for page in scan:
-            contents = page.get_contents()
-            full_names = paint_names(page)
-            per_stream: list[list[str]] = []
-            safe_boundary = True
+    for page in document:
+        contents = page.get_contents()
+        resources = scanner.page_resources(page)
+        data = b"\n".join(document.xref_stream(xref) for xref in contents)
+        full_events = scanner.trace(data, resources)
+        per_stream = []
+        safe_boundary = True
+        try:
             for stream_xref in contents:
-                data = scan.xref_stream(stream_xref)
-                parsed = DecodedStreamObject()
-                parsed.set_data(data)
-                depth, marked = 0, 0
-                try:
-                    with _pdf_parse_configuration():
-                        operators = ContentStream(parsed, None).operations
-                    for _, operator in operators:
-                        if operator == b"q":
-                            depth += 1
-                        elif operator == b"Q":
-                            depth -= 1
-                        elif operator in {b"BMC", b"BDC"}:
-                            marked += 1
-                        elif operator == b"EMC":
-                            marked -= 1
-                        elif operator in {b"cm", b"W", b"W*"} and depth == 0:
-                            safe_boundary = False
-                        if depth < 0 or marked < 0:
-                            safe_boundary = False
-                    if depth or marked:
+                data = document.xref_stream(stream_xref)
+                depth = 0
+                for _, operator in scanner.operations(data):
+                    if operator == b"q":
+                        depth += 1
+                    elif operator == b"Q":
+                        depth -= 1
+                    elif operator in {b"cm", b"W", b"W*"} and depth == 0:
                         safe_boundary = False
-                except Exception as exc:
-                    raise PdfEngineError("无法安全解析 PDF 内容流；请保留原密度使用原生图像替换，或重新导出各图层独立的内容流") from exc
-                page.set_contents(stream_xref)
-                per_stream.append(paint_names(page))
-            for layer_xref, layer_name in names.items():
-                matching = [index for index, entries in enumerate(per_stream) if layer_name in entries]
-                positions = [index for index, name in enumerate(full_names) if name == layer_name]
-                mixed_stream = any(any(name != layer_name for name in per_stream[index]) for index in matching)
-                interleaved = bool(positions) and any(name != layer_name for name in full_names[min(positions):max(positions) + 1])
-                scope_mismatch = sum(entries.count(layer_name) for entries in per_stream) != len(positions)
-                if positions and (not safe_boundary or mixed_stream or interleaved or scope_mismatch):
-                    raise PdfEngineError(
-                        f"第 {page.number + 1} 页的图层“{layer_name}”与其他内容交错，无法在重采样时保证层叠顺序；"
-                        "请重新导出各图层独立的内容流，或省略 dpi 保留原密度以使用原生图像替换"
-                    )
-                anchors[(page.number, layer_xref)] = contents[max(matching)] if matching else None
-            scan.xref_set_key(page.xref, "Contents", "[" + " ".join(f"{xref} 0 R" for xref in contents) + "]")
+                per_stream.append(scanner.trace(data, resources))
+        except Exception as exc:
+            raise PdfEngineError("无法安全解析 PDF 内容流；请保留原密度使用原生图像替换，或重新导出各图层独立的内容流") from exc
+        for layer_xref in selected:
+            only_layer = frozenset({layer_xref})
+            matching = [index for index, events in enumerate(per_stream) if any(layer_xref in event.layer_xrefs for event in events)]
+            positions = [index for index, event in enumerate(full_events) if layer_xref in event.layer_xrefs]
+            mixed_stream = any(any(event.layer_xrefs != only_layer or not event.exact_layer for event in per_stream[index]) for index in matching)
+            interleaved = bool(positions) and any(event.layer_xrefs != only_layer or not event.exact_layer for event in full_events[min(positions):max(positions) + 1])
+            if positions and (not safe_boundary or mixed_stream or interleaved):
+                name = str(scanner.ocgs[layer_xref].get("name") or layer_xref)
+                raise PdfEngineError(
+                    f"第 {page.number + 1} 页的图层“{name}”（xref {layer_xref}）与其他内容交错，无法在重采样时保证层叠顺序；"
+                    "请重新导出各图层独立的内容流，或省略 dpi 保留原密度以使用原生图像替换"
+                )
+            anchors[(page.number, layer_xref)] = contents[max(matching)] if matching else None
     return anchors
 
 
@@ -1473,6 +1512,7 @@ def replace_pdf_layers(
         if render_document.needs_pass:
             raise PdfEngineError("暂不支持有密码的 PDF")
         source_ocgs = render_document.get_ocgs() or {}
+        source_layer_state = _layer_state(render_document)
         missing = [xref for xref in selected if xref not in source_ocgs]
         if missing:
             raise PdfEngineError(f"PDF 中不存在所选图层：{missing}")
@@ -1497,7 +1537,7 @@ def replace_pdf_layers(
         processed_layer_names = [
             str(source_ocgs[xref].get("name") or f"图层 {xref}") for xref in selected
         ]
-        direct_layers = _discover_direct_layer_images(output_document)
+        direct_layers = _discover_direct_layer_images(output_document, selected_layer_xrefs=selected)
         # Safe image-only layers can also be resampled in place. Keeping the
         # image xref and its original painting operators preserves ordering,
         # even inside forms containing interleaved technical content.
@@ -1552,7 +1592,36 @@ def replace_pdf_layers(
             replacement_mode = "ocg-overlay"
 
         final_ocgs = output_document.get_ocgs() or {}
+        duplicate_names: dict[str, list[int]] = {}
+        for xref, detail in final_ocgs.items():
+            duplicate_names.setdefault(str(detail.get("name") or ""), []).append(int(xref))
+        for matching in duplicate_names.values():
+            if len(matching) > 1:
+                for xref in matching:
+                    if xref in selected or xref in overlay_replacements.values():
+                        # MuPDF can treat structurally identical OCG dictionaries
+                        # as the same group when reloading ON/OFF configuration.
+                        # A private identity keeps references distinct while the
+                        # user-visible /Name remains exactly as supplied.
+                        output_document.xref_set_key(xref, "CMYKRecipeOCGId", str(xref))
         final_on = [int(xref) for xref, detail in final_ocgs.items() if bool(detail.get("on", True))]
+        if replacement_mode == "native-images":
+            for matching in duplicate_names.values():
+                if len(matching) > 1:
+                    for xref in matching:
+                        if xref not in selected:
+                            continue
+                        # A duplicate may already be misreported by get_ocgs()
+                        # in the input. Preserve the PDF's reference-based
+                        # default configuration, rather than that cached state.
+                        configured_on = xref in source_layer_state["on"] or (
+                            xref not in source_layer_state["off"]
+                            and str(source_layer_state["basestate"] or "ON").upper() != "OFF"
+                        )
+                        if configured_on and xref not in final_on:
+                            final_on.append(xref)
+                        elif not configured_on and xref in final_on:
+                            final_on.remove(xref)
         if replacement_mode == "ocg-overlay":
             final_on = [xref for xref in final_on if xref not in selected]
             for replacement in overlay_replacements.values():

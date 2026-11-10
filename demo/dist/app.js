@@ -352,7 +352,8 @@
       state.resultBytes = Number(record.result_bytes) || 0;
       state.resultUrl = `/api/jobs/${encodeURIComponent(state.jobId)}/result?preview=1`;
       text(el.taskHeading, "颜色处理已完成");
-      text(el.taskMessage, "CMYK PDF 已生成。页面尺寸与未选图层已保留，可预览或下载结果。");
+      const retentionHours = Number(state.capabilities?.storage?.jobRetentionHours) || 24;
+      text(el.taskMessage, `CMYK PDF 已生成，页面尺寸与未选图层已保留。结果保留 ${round(retentionHours)} 小时，请及时下载。`);
       setProgress(100, 3);
       text(el.resultDevice, info.deviceName || state.capabilities?.gpuName || "GPU");
       const dpi = Number(result.dpi);

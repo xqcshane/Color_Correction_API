@@ -416,3 +416,154 @@ def test_explicit_density_rejects_shared_image_at_different_scales(tmp_path: Pat
     with pytest.raises(PdfEngineError, match="不同尺寸下复用"):
         replace_pdf_layers(source, output, selected_layer_xrefs=[artwork], dpi=72, mapper=_cyan_mapper, preserve_native_density=False)
 
+
+@pytest.mark.parametrize("separate_pages", [False, True])
+@pytest.mark.parametrize("explicit_dpi", [False, True])
+@pytest.mark.parametrize("inherited_ocg", [False, True])
+def test_duplicate_named_image_layers_use_distinct_xrefs(tmp_path: Path, separate_pages, explicit_dpi, inherited_ocg) -> None:
+    source, output = tmp_path / "duplicates.pdf", tmp_path / "output.pdf"
+    document = pymupdf.open()
+    first = document.add_ocg("Print_Artwork")
+    second = document.add_ocg("Print_Artwork")
+    technical = document.add_ocg("Technical")
+    image_xrefs = []
+    content_xrefs = []
+    for index, layer in enumerate((first, second)):
+        page = document.new_page(width=400, height=160) if index == 0 or separate_pages else document[0]
+        rect = pymupdf.Rect(0 if separate_pages or index == 0 else 200, 0, 200 if separate_pages or index == 0 else 360, 100 if index == 0 else 80)
+        rgb = np.full((60, 120, 3), 80 + 40 * index, dtype=np.uint8)
+        image_xref = page.insert_image(rect, pixmap=pymupdf.Pixmap(pymupdf.csRGB, 120, 60, rgb.tobytes(), False), keep_proportion=False, oc=layer)
+        image_xrefs.append(image_xref)
+        content_xrefs.append((page.number, page.get_contents()[-1], layer))
+        page.draw_line(pymupdf.Point(0, 50), pymupdf.Point(400, 50), color=(0, 0, 0), width=4, oc=technical)
+    # Distinct image objects can contain identical pixels. A hash-based xref
+    # lookup would merge these references and lose their different DPI targets.
+    document.update_stream(image_xrefs[1], document.xref_stream(image_xrefs[0]))
+    if inherited_ocg:
+        for page_index, stream_xref, layer in content_xrefs:
+            page = document[page_index]
+            name = f"Duplicate{layer}"
+            resources_xref = int(document.xref_get_key(page.xref, "Resources")[1].split()[0])
+            document.xref_set_key(resources_xref, f"Properties/{name}", f"{layer} 0 R")
+            document.update_stream(stream_xref, f"/OC /{name} BDC\n".encode() + document.xref_stream(stream_xref) + b"\nEMC")
+        for image_xref in image_xrefs:
+            document.xref_set_key(image_xref, "OC", "null")
+    document.save(source, deflate=True)
+    document.close()
+    with pymupdf.open(source) as original:
+        original_streams = {xref: original.xref_stream(xref) for page in original for xref in page.get_contents()}
+        original_ocgs = original.get_ocgs()
+    calls = []
+
+    def mapper(rgba, width, height, context):
+        calls.append(context.layer_xref)
+        cmyk = np.zeros((height, width, 4), dtype=np.uint8)
+        cmyk[..., 0 if context.layer_xref == first else 1] = 255
+        return TileResult(cmyk.tobytes())
+
+    result = replace_pdf_layers(source, output, selected_layer_xrefs=[first, second], dpi=72 if explicit_dpi else 36, mapper=mapper, preserve_native_density=not explicit_dpi)
+    assert result["replacementMode"] == "native-images"
+    assert calls.count(first) == calls.count(second) == 1
+    assert result["replacedImageXrefs"] == {str(first): [image_xrefs[0]], str(second): [image_xrefs[1]]}
+    with pymupdf.open(output) as final:
+        assert final.get_ocgs() == original_ocgs
+        assert final.page_count == (2 if separate_pages else 1)
+        for xref, content in original_streams.items():
+            assert final.xref_stream(xref) == content
+        for index, image_xref in enumerate(image_xrefs):
+            expected = (200, 100) if index == 0 else (160 if not separate_pages else 200, 80)
+            if not explicit_dpi:
+                expected = (120, 60)
+            assert final.xref_get_key(image_xref, "Width") == ("int", str(expected[0]))
+            assert final.xref_get_key(image_xref, "Height") == ("int", str(expected[1]))
+            assert final.xref_get_key(image_xref, "ColorSpace") == ("name", "/DeviceCMYK")
+            assert final.xref_stream(image_xref)[:4] == bytes([255, 0, 0, 0] if index == 0 else [0, 255, 0, 0])
+
+
+@pytest.mark.parametrize("separate_pages", [False, True])
+@pytest.mark.parametrize("as_forms", [False, True])
+def test_duplicate_named_vector_layers_keep_individual_paint_order(tmp_path: Path, separate_pages, as_forms) -> None:
+    source, output = tmp_path / "duplicate-vectors.pdf", tmp_path / "output.pdf"
+    document = pymupdf.open()
+    first = document.add_ocg("Print_Artwork")
+    second = document.add_ocg("Print_Artwork")
+    technical = document.add_ocg("Technical")
+    page = document.new_page(width=400, height=160)
+    page.draw_rect(pymupdf.Rect(0, 0, 200, 100), fill=(1, 0, 0), color=None, oc=first)
+    selected_streams = [(page.number, page.get_contents()[-1])]
+    page.draw_line(pymupdf.Point(0, 50), pymupdf.Point(400, 50), color=(0, 0, 0), width=4, oc=technical)
+    if separate_pages:
+        page = document.new_page(width=400, height=160)
+    page.draw_rect(pymupdf.Rect(200, 0, 400, 100), fill=(0, 1, 0), color=None, oc=second)
+    selected_streams.append((page.number, page.get_contents()[-1]))
+    if as_forms:
+        for page_index, content_xref in selected_streams:
+            page = document[page_index]
+            resources = document.xref_get_key(page.xref, "Resources")[1]
+            form_xref = document.get_new_xref()
+            document.update_object(form_xref, f"<< /Type /XObject /Subtype /Form /BBox [0 0 400 160] /Resources {resources} >>")
+            document.update_stream(form_xref, document.xref_stream(content_xref))
+            resource_xref = int(resources.split()[0])
+            document.xref_set_key(resource_xref, f"XObject/DuplicateForm{form_xref}", f"{form_xref} 0 R")
+            document.update_stream(content_xref, f"q /DuplicateForm{form_xref} Do Q".encode())
+    document.save(source)
+    document.close()
+    calls = []
+
+    def mapper(rgba, width, height, context):
+        calls.append(context.layer_xref)
+        cmyk = np.zeros((height, width, 4), dtype=np.uint8)
+        cmyk[..., 0 if context.layer_xref == first else 1] = 255
+        return TileResult(cmyk.tobytes())
+
+    result = replace_pdf_layers(source, output, selected_layer_xrefs=[first, second], dpi=72, mapper=mapper)
+    assert result["replacementMode"] == "ocg-overlay"
+    assert calls.count(first) == calls.count(second) == 1
+    assert set(result["replacementLayers"]) == {str(first), str(second)}
+    with pymupdf.open(output) as final:
+        assert final.get_ocgs()[technical]["on"]
+        assert not final.get_ocgs()[first]["on"] and not final.get_ocgs()[second]["on"]
+        left = np.frombuffer(final[0].get_pixmap(colorspace=pymupdf.csRGB).samples, dtype=np.uint8).reshape(160, 400, 3)
+        right = np.frombuffer(final[-1].get_pixmap(colorspace=pymupdf.csRGB).samples, dtype=np.uint8).reshape(160, 400, 3)
+        assert left[30, 80, 0] < 100 and left[30, 80, 1] > 100
+        assert np.all(left[50, 80] < 20)  # technical line above first OCG
+        assert right[30, 280, 1] < 100 and right[30, 280, 0] > 100
+        assert right[50, 280, 0] > 100  # second OCG stays above the earlier line
+
+
+@pytest.mark.parametrize("explicit_dpi", [False, True])
+@pytest.mark.parametrize("base_state_off", [False, True])
+def test_same_raster_shared_by_duplicate_named_layers_is_converted_once(tmp_path: Path, explicit_dpi, base_state_off) -> None:
+    source, output = tmp_path / "shared-duplicates.pdf", tmp_path / "output.pdf"
+    document = pymupdf.open()
+    first, second = document.add_ocg("Print_Artwork"), document.add_ocg("Print_Artwork")
+    page = document.new_page(width=400, height=100)
+    rgb = np.full((60, 120, 3), 100, dtype=np.uint8)
+    image_xref = page.insert_image(pymupdf.Rect(0, 0, 200, 100), pixmap=pymupdf.Pixmap(pymupdf.csRGB, 120, 60, rgb.tobytes(), False))
+    first_content = page.get_contents()[-1]
+    page.insert_image(pymupdf.Rect(200, 0, 400, 100), xref=image_xref)
+    second_content = page.get_contents()[-1]
+    resource_xref = int(document.xref_get_key(page.xref, "Resources")[1].split()[0])
+    for content_xref, layer in ((first_content, first), (second_content, second)):
+        document.xref_set_key(resource_xref, f"Properties/Group{layer}", f"{layer} 0 R")
+        document.update_stream(content_xref, f"/OC /Group{layer} BDC\n".encode() + document.xref_stream(content_xref) + b"\nEMC")
+    if base_state_off:
+        document.set_layer(-1, on=[first, second], off=[], basestate="OFF")
+    document.save(source)
+    document.close()
+    calls = []
+
+    def mapper(rgba, width, height, context):
+        calls.append(context.layer_xref)
+        return _cyan_mapper(rgba, width, height, context)
+
+    result = replace_pdf_layers(source, output, selected_layer_xrefs=[first, second], dpi=72, mapper=mapper, preserve_native_density=not explicit_dpi)
+    assert result["replacementMode"] == "native-images"
+    assert len(calls) == 1
+    assert result["replacedImageXrefs"] == {str(first): [image_xref], str(second): [image_xref]}
+    with pymupdf.open(output) as final:
+        assert final.get_ocgs()[first]["on"] and final.get_ocgs()[second]["on"]
+        assert final.xref_get_key(image_xref, "Width") == ("int", "200" if explicit_dpi else "120")
+        rendered = np.frombuffer(final[0].get_pixmap(colorspace=pymupdf.csRGB).samples, dtype=np.uint8).reshape(100, 400, 3)
+        assert rendered[30, 80, 0] < 100 and rendered[30, 280, 0] < 100
+

@@ -43,6 +43,7 @@ if [[ ! "$timeout" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 docker compose build --pull color-api
+bash scripts/prepare-output.sh
 if ! docker compose up -d --wait --wait-timeout "$timeout" color-api; then
   docker compose logs --tail=100 color-api >&2
   printf 'Deployment did not become ready. Check GPU / CUDA and the logs above.\n' >&2
