@@ -567,3 +567,111 @@ def test_same_raster_shared_by_duplicate_named_layers_is_converted_once(tmp_path
         rendered = np.frombuffer(final[0].get_pixmap(colorspace=pymupdf.csRGB).samples, dtype=np.uint8).reshape(100, 400, 3)
         assert rendered[30, 80, 0] < 100 and rendered[30, 280, 0] < 100
 
+
+def test_interleaved_native_images_and_cmyk_fills_keep_paths_opacity_and_color_state(tmp_path: Path) -> None:
+    source, output = tmp_path / "mixed.pdf", tmp_path / "corrected.pdf"
+    with pymupdf.open() as document:
+        page = document.new_page(width=100, height=50)
+        raster = document.add_ocg("Print_Artwork")
+        vectors = document.add_ocg("Print_Artwork")
+        guide = document.add_ocg("Cut_Line")
+        resource = int(document.xref_get_key(page.xref, "Resources")[1].split()[0])
+        document.xref_set_key(resource, "Properties", f"<</Art {vectors} 0 R /Guide {guide} 0 R>>")
+        document.xref_set_key(resource, "ExtGState", "<</Half <</ca 0.5>>>>")
+        document.xref_set_key(guide, "Usage/Print/PrintState", "/OFF")
+        sample = pymupdf.Pixmap(pymupdf.csCMYK, 2, 1, bytes([0, 255, 0, 0, 0, 0, 255, 0]), False)
+        image = page.insert_image(pymupdf.Rect(0, 0, 15, 10), pixmap=sample, keep_proportion=False, oc=raster)
+        document.xref_set_key(image, "ImageMask", "false")
+        stream = page.get_contents()[0]
+        # The magenta ink is set outside either OCG. The half-transparent yellow
+        # fill is scoped by q/Q; the two guide shapes later inherit magenta.
+        paint = b"""
+0 1 0 0 k
+/OC /Art BDC
+10 10 30 30 re f
+q /Half gs 0 0 1 0 k 30 5 30 30 re 36 12 6 6 re f* Q
+EMC
+/OC /Guide BDC 20 24 60 4 re f EMC
+/OC /Art BDC 60 10 10 30 re f EMC
+/OC /Guide BDC
+% Preserve this literal: f* /OC q Q and 0 0 0 1 k
+75.00000000001 10 15 30 re f
+EMC
+"""
+        document.update_stream(stream, document.xref_stream(stream) + paint)
+        document.save(source)
+
+    def distinguish_inks(rgba, width, height, context):
+        rgb = np.frombuffer(rgba, dtype=np.uint8).reshape(height, width, 4)
+        # Magenta has more blue than green; yellow has more green than blue.
+        magenta = rgb[..., 2] > rgb[..., 1]
+        cmyk = np.zeros_like(rgb)
+        cmyk[..., 0] = np.where(magenta, 255, 0)
+        cmyk[..., 3] = np.where(magenta, 0, 255)
+        return TileResult(cmyk.tobytes())
+
+    result = replace_pdf_layers(source, output, selected_layer_xrefs=[raster, vectors],
+                                dpi=72, mapper=distinguish_inks)
+    assert result["replacementMode"] == "native-images-and-fills"
+    cyan_and_black = bytes([255, 0, 0, 0, 0, 0, 0, 255])
+    with pymupdf.open(source) as reference, pymupdf.open(output) as corrected:
+        assert corrected.xref_stream(image) == cyan_and_black
+        assert corrected.get_ocgs() == reference.get_ocgs()
+        assert corrected.get_layer(-1) == reference.get_layer(-1)
+        assert corrected.xref_get_key(guide, "Usage/Print/PrintState") == ("name", "/OFF")
+        technical_bytes = paint[paint.rindex(b"/OC /Guide BDC"):].strip()
+        assert technical_bytes in corrected[0].read_contents()
+        before, after = reference[0].get_drawings(), corrected[0].get_drawings()
+        assert [d["items"] for d in after] == [d["items"] for d in before]
+        assert [d["fill_opacity"] for d in after] == [d["fill_opacity"] for d in before]
+        # Build an independent oracle: change only the three intended draws and
+        # the two-pixel image, leaving the original ink live for both guides.
+        data = reference.xref_stream(stream)
+        for shape in (b"10 10 30 30 re f", b"60 10 10 30 re f"):
+            data = data.replace(shape, b"q 1 0 0 0 k " + shape + b" Q")
+        reference.update_stream(stream, data.replace(b"0 0 1 0 k", b"0 0 0 1 k"))
+        reference.update_stream(image, cyan_and_black)
+        reference.xref_set_key(image, "ColorSpace", "/DeviceCMYK")
+        assert corrected[0].get_pixmap().samples == reference[0].get_pixmap().samples
+
+    resampled = replace_pdf_layers(source, tmp_path / "explicit-dpi.pdf", selected_layer_xrefs=[raster, vectors],
+                                   dpi=144, preserve_native_density=False, mapper=distinguish_inks)
+    assert resampled["replacementMode"] == "native-images-and-fills"
+    assert resampled["resampledImagePixels"][str(image)] == {"width": 30, "height": 20}
+
+
+def test_shared_page_stream_does_not_recolor_other_pages_resources(tmp_path: Path) -> None:
+    source, output = tmp_path / "shared.pdf", tmp_path / "corrected.pdf"
+    with pymupdf.open() as document:
+        artwork, guide = document.add_ocg("Artwork"), document.add_ocg("Technical")
+        stream = document.get_new_xref()
+        document.update_object(stream, "<<>>")
+        document.update_stream(stream, b"0 1 0 0 k /OC /Layer BDC 1 1 18 18 re f EMC "
+                                      b"/OC /Guide BDC 2 8 16 4 re f EMC")
+        for layer in (artwork, guide):
+            page = document.new_page(width=20, height=20)
+            document.xref_set_key(page.xref, "Resources", f"<</Properties <</Layer {layer} 0 R /Guide {guide} 0 R>>>>")
+            page.set_contents(stream)
+        document.save(source)
+    replace_pdf_layers(source, output, selected_layer_xrefs=[artwork], dpi=72, mapper=_cyan_mapper)
+    with pymupdf.open(source) as original, pymupdf.open(output) as corrected:
+        assert corrected[0].get_pixmap().samples != original[0].get_pixmap().samples
+        assert corrected[1].get_pixmap().samples == original[1].get_pixmap().samples
+
+
+def test_changed_fill_space_does_not_reuse_stale_device_cmyk(tmp_path: Path) -> None:
+    source, output = tmp_path / "color-spaces.pdf", tmp_path / "corrected.pdf"
+    with pymupdf.open() as document:
+        page = document.new_page(width=20, height=20)
+        ink, guide = document.add_ocg("Artwork"), document.add_ocg("Technical")
+        document.xref_set_key(page.xref, "Resources", f"<</Properties <</Art {ink} 0 R /Guide {guide} 0 R>>>>")
+        stream = document.get_new_xref()
+        document.update_object(stream, "<<>>")
+        document.update_stream(stream, b"/OC /Art BDC 0 1 0 0 k 1 1 9 9 re f EMC "
+                                      b"/OC /Guide BDC 9 9 4 4 re f EMC "
+                                      b"/OC /Art BDC /DeviceRGB cs 0 0 1 sc 10 10 9 9 re f EMC")
+        page.set_contents(stream)
+        document.save(source)
+    with pytest.raises(PdfEngineError, match="交错"):
+        replace_pdf_layers(source, output, selected_layer_xrefs=[ink], dpi=72, mapper=_cyan_mapper)
+

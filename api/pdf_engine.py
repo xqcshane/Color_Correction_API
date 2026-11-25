@@ -398,6 +398,14 @@ def _bbox_close(first: Any, second: Any, tolerance: float = 0.25) -> bool:
 
 
 @dataclass(frozen=True)
+class _NativeFill:
+    operation_index: int
+    color: tuple[int, int, int, int]
+    layer_xref: int
+    path_start: int
+
+
+@dataclass(frozen=True)
 class _PaintEvent:
     kind: str
     layer_xrefs: frozenset[int]
@@ -405,6 +413,7 @@ class _PaintEvent:
     exact_layer: bool = True
     width_pt: float = 0.0
     height_pt: float = 0.0
+    fill: _NativeFill | None = None
 
 
 class _PdfPaintScanner:
@@ -476,8 +485,8 @@ class _PdfPaintScanner:
         # rendering path; they cannot be assigned to one image-only OCG.
         return frozenset(refs), False
 
-    def trace(self, data: bytes, resources, inherited: frozenset[int] = frozenset(), inherited_exact: bool = True, matrix=None) -> list[_PaintEvent]:
-        from pypdf.generic import IndirectObject, NameObject
+    def trace(self, data: bytes, resources, inherited: frozenset[int] = frozenset(), inherited_exact: bool = True, matrix=None, *, native_fills: bool = False) -> list[_PaintEvent]:
+        from pypdf.generic import FloatObject, IndirectObject, NameObject, NumberObject
 
         resources = self.dictionary(resources)
         properties = self.dictionary(resources.get("/Properties"))
@@ -485,18 +494,49 @@ class _PdfPaintScanner:
         groups, exact = inherited, inherited_exact
         pymupdf = _pymupdf()
         matrix = pymupdf.Matrix(matrix) if matrix is not None else pymupdf.Matrix(1, 1)
-        matrix_stack = []
+        native_fills = native_fills and "/DefaultCMYK" not in self.dictionary(resources.get("/ColorSpace"))
+        ext_states = self.dictionary(resources.get("/ExtGState")) if native_fills else {}
+        fill_color = None
+        simple_graphics = True
+        graphics_stack = []
+        path_start = None
+        path_open = False
         stack: list[tuple[frozenset[int], bool]] = []
         events = []
-        for operands, operator in self.operations(data):
+        for index, (operands, operator) in enumerate(self.operations(data)):
+            if native_fills:
+                if operator in {b"m", b"re", b"l", b"c", b"v", b"y", b"h"}:
+                    if not path_open:
+                        path_start = index if operator in {b"m", b"re"} else None
+                    path_open = True
+                elif operator not in {b"f", b"F", b"f*"}:
+                    # Only wrap a whole, uninterrupted path. In particular W/W*
+                    # changes the clip after painting and must outlive that path.
+                    path_start = None
+                    if operator in {b"n", b"S", b"s", b"B", b"B*", b"b", b"b*"}:
+                        path_open = False
+                    elif operator in {b"W", b"W*"}:
+                        path_open = True
             if operator == b"q":
-                matrix_stack.append(pymupdf.Matrix(matrix))
+                graphics_stack.append((pymupdf.Matrix(matrix), fill_color, simple_graphics))
             elif operator == b"Q":
-                if not matrix_stack:
+                if not graphics_stack:
                     raise PdfEngineError("PDF 图形状态栈不匹配")
-                matrix = matrix_stack.pop()
+                matrix, fill_color, simple_graphics = graphics_stack.pop()
             elif operator == b"cm":
                 matrix = pymupdf.Matrix(*map(float, operands)) * matrix
+            elif native_fills and operator == b"gs":
+                state = self.dictionary(ext_states.get(operands[0])) if len(operands) == 1 else None
+                # Flat CMYK with constant alpha is mapped independently of the
+                # backdrop. Defer transfer functions, overprint, blend modes
+                # and soft masks to the existing renderer.
+                simple_graphics = simple_graphics and bool(state) and set(state) <= {"/Type", "/ca", "/CA"}
+            elif native_fills and operator == b"k":
+                fill_color = None
+                if len(operands) == 4 and all(isinstance(v, (FloatObject, NumberObject)) and 0 <= v <= 1 for v in operands):
+                    fill_color = tuple(math.floor(float(v) * 255 + 0.5) for v in operands)
+            elif native_fills and operator in {b"cs", b"sc", b"scn", b"rg", b"g"}:
+                fill_color = None
             elif operator in {b"BDC", b"BMC"}:
                 stack.append((groups, exact))
                 if operator == b"BDC" and operands and str(operands[0]) == "/OC":
@@ -528,13 +568,23 @@ class _PdfPaintScanner:
                 else:
                     events.append(_PaintEvent("image", paint_groups or frozenset({0}), reference.idnum, paint_exact, math.hypot(matrix.a, matrix.b), math.hypot(matrix.c, matrix.d)))
             elif operator in {b"S", b"s", b"f", b"F", b"f*", b"B", b"B*", b"b", b"b*", b"Tj", b"TJ", b"'", b'"', b"sh", b"INLINE IMAGE"}:
-                events.append(_PaintEvent("other", groups or frozenset({0}), exact_layer=exact))
-        if stack or matrix_stack:
+                fill = None
+                if operator in {b"f", b"F", b"f*"}:
+                    if path_start is not None and fill_color is not None and simple_graphics and exact and len(groups) == 1:
+                        fill = _NativeFill(index, fill_color, next(iter(groups)), path_start)
+                    path_start, path_open = None, False
+                events.append(_PaintEvent("fill" if fill else "other", groups or frozenset({0}), exact_layer=exact, fill=fill))
+        if stack or graphics_stack:
             raise PdfEngineError("PDF 标记内容栈不匹配")
         return events
 
 
-def _discover_direct_layer_images(document: Any, selected_layer_xrefs: Iterable[int] | None = None) -> dict[int, list[LayerImage] | None]:
+def _discover_direct_layer_images(
+    document: Any, selected_layer_xrefs: Iterable[int] | None = None, *,
+    fills_by_page: dict[int, list[_NativeFill]] | None = None,
+) -> dict[int, list[LayerImage] | None]:
+    from pypdf.generic import BooleanObject, NullObject
+
     scanner = _PdfPaintScanner(document)
     selected = set(selected_layer_xrefs) if selected_layer_xrefs is not None else None
     layer_images: dict[int, list[LayerImage] | None] = {int(xref): [] for xref in scanner.ocgs}
@@ -542,7 +592,10 @@ def _discover_direct_layer_images(document: Any, selected_layer_xrefs: Iterable[
     unsafe_layers: set[int] = set()
     for page_index, page in enumerate(document):
         data = b"\n".join(document.xref_stream(xref) for xref in page.get_contents())
-        for event in scanner.trace(data, scanner.page_resources(page), matrix=page.transformation_matrix):
+        for event in scanner.trace(data, scanner.page_resources(page), matrix=page.transformation_matrix, native_fills=fills_by_page is not None):
+            if fills_by_page is not None and event.fill is not None and selected is not None and event.fill.layer_xref in selected:
+                fills_by_page.setdefault(page_index, []).append(event.fill)
+                continue
             assignable = len(event.layer_xrefs) == 1 or (selected is not None and event.layer_xrefs <= selected)
             if event.kind != "image" or not event.exact_layer or not assignable:
                 unsafe_layers.update(event.layer_xrefs)
@@ -555,7 +608,11 @@ def _discover_direct_layer_images(document: Any, selected_layer_xrefs: Iterable[
             for layer_xref in event.layer_xrefs:
                 if layer_xref not in layer_images:
                     continue
-                if bool(obj.get("/ImageMask")) or obj.get("/Mask"):
+                stencil = obj.get("/ImageMask")
+                mask_entry = obj.get("/Mask")
+                if (stencil.value if isinstance(stencil, BooleanObject) else stencil) or (
+                    mask_entry is not None and not isinstance(mask_entry, NullObject)
+                ):
                     unsafe_layers.add(layer_xref)
                 mask = obj.get("/SMask")
                 layer_images[layer_xref].append(LayerImage(
@@ -876,7 +933,7 @@ def _replace_native_layer_images(
     target_sizes: Mapping[int, tuple[int, int]] | None = None,
     resampled_masks: dict[int, int] | None = None,
 ) -> dict[int, list[int]]:
-    if any(not direct_layers.get(layer_xref) for layer_xref in selected):
+    if any(direct_layers.get(layer_xref) is None for layer_xref in selected):
         raise PdfEngineError("所选图层不能使用原生图像替换")
     # A raster reused by several selected OCGs has one shared stream. Convert
     # that stream once, retaining each layer's reference to the same xref.
@@ -910,6 +967,84 @@ def _replace_native_layer_images(
         )
         completed += image_tasks
     return replacements
+
+
+def _insert_at_operation_boundaries(data: bytes, insertions: Mapping[int, bytes]) -> bytes:
+    """Insert PDF instructions without re-encoding original numbers, strings or inline images."""
+    from pypdf.generic import ContentStream
+
+    source = BytesIO(data)
+    offsets = {0: 0}
+
+    # Use the same pypdf content parser as trace(). Its operation list receives
+    # each completed instruction while the cursor is still at its byte boundary.
+    class OperationBoundaries(list):
+        count = 0
+
+        def append(self, operation) -> None:
+            self.count += 1
+            if self.count in insertions:
+                offsets[self.count] = source.tell()
+
+    parser = ContentStream(None, None)
+    parser.operations = OperationBoundaries()
+    with _pdf_parse_configuration():
+        parser._parse_content_stream(source)
+    result = BytesIO()
+    last = 0
+    for index in sorted(insertions):
+        offset = offsets[index]
+        result.write(data[last:offset])
+        result.write(insertions[index])
+        last = offset
+    result.write(data[last:])
+    return result.getvalue()
+
+
+def _replace_native_fills(
+    document: Any,
+    fills_by_page: Mapping[int, Sequence[_NativeFill]],
+    mapper: TileMapper,
+    cancelled: Callable[[], bool] | None,
+) -> None:
+    pymupdf = _pymupdf()
+    ocgs = document.get_ocgs()
+    for page_index, fills in fills_by_page.items():
+        inks_by_layer: dict[int, dict[tuple[int, ...], bytes]] = {}
+        for fill in fills:
+            inks_by_layer.setdefault(fill.layer_xref, {})[fill.color] = b""
+        for layer_xref, inks in inks_by_layer.items():
+            colors = list(inks)
+            for start in range(0, len(colors), 1024):
+                _check_cancelled(cancelled)
+                batch = colors[start:start + 1024]
+                width = len(batch)
+                cmyk = pymupdf.Pixmap(pymupdf.csCMYK, width, 1, b"".join(map(bytes, batch)), False)
+                rgba = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.Pixmap(cmyk, 1))
+                tile = TilePlan(index=0, total=1, page_index=page_index, page_width_px=width,
+                                page_height_px=1, x=0, y=0, width=width, height=1,
+                                outer_x=0, outer_y=0, outer_width=width, outer_height=1, dpi=0)
+                context = TileContext(page_index, layer_xref, ocgs[layer_xref]["name"], tile, (0, 0, width, 1))
+                mapped = _normalise_mapper_result(mapper(rgba.samples, width, 1, context), width=width, height=1)
+                samples = bytes(mapped.cmyk)
+                for i, color in enumerate(batch):
+                    channels = samples[4 * i:4 * i + 4]
+                    inks[color] = (" ".join(f"{v / 255:.9f}" for v in channels) + " k").encode("ascii")
+        # Bracket each whole path so the new ink cannot leak across OCGs.
+        # Keeping the original fill operator also preserves even-odd holes.
+        insertions: dict[int, bytes] = {}
+        for fill in fills:
+            ink = inks_by_layer[fill.layer_xref][fill.color]
+            insertions[fill.path_start] = insertions.get(fill.path_start, b"") + b"\nq " + ink + b"\n"
+            insertions[fill.operation_index + 1] = b"\nQ\n"
+        page = document[page_index]
+        original = b"\n".join(document.xref_stream(xref) for xref in page.get_contents())
+        # A page content stream may be shared and interpreted using different
+        # OCG resources on another page. Change only this page's reference.
+        stream = document.get_new_xref()
+        document.update_object(stream, "<<>>")
+        document.update_stream(stream, _insert_at_operation_boundaries(original, insertions))
+        page.set_contents(stream)
 
 
 def _native_resample_sizes(document: Any, images: Sequence[LayerImage], dpi: float) -> dict[int, tuple[int, int]]:
@@ -1512,7 +1647,6 @@ def replace_pdf_layers(
         if render_document.needs_pass:
             raise PdfEngineError("暂不支持有密码的 PDF")
         source_ocgs = render_document.get_ocgs() or {}
-        source_layer_state = _layer_state(render_document)
         missing = [xref for xref in selected if xref not in source_ocgs]
         if missing:
             raise PdfEngineError(f"PDF 中不存在所选图层：{missing}")
@@ -1537,7 +1671,10 @@ def replace_pdf_layers(
         processed_layer_names = [
             str(source_ocgs[xref].get("name") or f"图层 {xref}") for xref in selected
         ]
-        direct_layers = _discover_direct_layer_images(output_document, selected_layer_xrefs=selected)
+        fills_by_page: dict[int, list[_NativeFill]] = {}
+        direct_layers = _discover_direct_layer_images(
+            output_document, selected_layer_xrefs=selected, fills_by_page=fills_by_page,
+        )
         # Safe image-only layers can also be resampled in place. Keeping the
         # image xref and its original painting operators preserves ordering,
         # even inside forms containing interleaved technical content.
@@ -1545,7 +1682,11 @@ def replace_pdf_layers(
         # materialise one complete image at the final write step.
         native_max_pixels = max(1, int(os.getenv("CMYK_PDF_NATIVE_MAX_PIXELS", "64000000")))
         direct_images = [image for xref in selected for image in direct_layers.get(xref) or ()]
-        direct_mode = all(direct_layers.get(xref) for xref in selected)
+        fill_layers = {fill.layer_xref for fills in fills_by_page.values() for fill in fills}
+        direct_mode = all(
+            direct_layers[xref] is not None and (direct_layers[xref] or xref in fill_layers)
+            for xref in selected
+        )
         target_sizes = (
             _native_resample_sizes(output_document, direct_images, dpi)
             if direct_mode and not preserve_native_density else {}
@@ -1575,7 +1716,8 @@ def replace_pdf_layers(
                     target_sizes=target_sizes,
                     resampled_masks=resampled_masks,
                 )
-            replacement_mode = "native-images"
+            _replace_native_fills(output_document, fills_by_page, mapper, cancelled)
+            replacement_mode = "native-images-and-fills" if fills_by_page else "native-images"
         else:
             overlay_replacements, page_plans, stats, processed_layer_names = _replace_overlay_layers(
                 render_document,
@@ -1604,36 +1746,16 @@ def replace_pdf_layers(
                         # A private identity keeps references distinct while the
                         # user-visible /Name remains exactly as supplied.
                         output_document.xref_set_key(xref, "CMYKRecipeOCGId", str(xref))
-        final_on = [int(xref) for xref, detail in final_ocgs.items() if bool(detail.get("on", True))]
-        if replacement_mode == "native-images":
-            for matching in duplicate_names.values():
-                if len(matching) > 1:
-                    for xref in matching:
-                        if xref not in selected:
-                            continue
-                        # A duplicate may already be misreported by get_ocgs()
-                        # in the input. Preserve the PDF's reference-based
-                        # default configuration, rather than that cached state.
-                        configured_on = xref in source_layer_state["on"] or (
-                            xref not in source_layer_state["off"]
-                            and str(source_layer_state["basestate"] or "ON").upper() != "OFF"
-                        )
-                        if configured_on and xref not in final_on:
-                            final_on.append(xref)
-                        elif not configured_on and xref in final_on:
-                            final_on.remove(xref)
+        # In-place edits keep the original OCGs, so their visibility and print
+        # configuration can be kept verbatim (even for duplicate layer names).
         if replacement_mode == "ocg-overlay":
-            final_on = [xref for xref in final_on if xref not in selected]
+            final_on = [int(xref) for xref, detail in final_ocgs.items()
+                        if bool(detail.get("on", True)) and xref not in selected]
             for replacement in overlay_replacements.values():
                 if replacement not in final_on:
                     final_on.append(replacement)
-        final_off = [int(xref) for xref in final_ocgs if int(xref) not in final_on]
-        output_document.set_layer(
-            -1,
-            on=final_on,
-            off=final_off,
-            basestate="OFF",
-        )
+            final_off = [int(xref) for xref in final_ocgs if int(xref) not in final_on]
+            output_document.set_layer(-1, on=final_on, off=final_off, basestate="OFF")
 
         _check_cancelled(cancelled)
         if progress:
@@ -1683,7 +1805,7 @@ def replace_pdf_layers(
             for image_xref, (width, height) in target_sizes.items():
                 if verification.xref_get_key(image_xref, "Width") != ("int", str(width)) or verification.xref_get_key(image_xref, "Height") != ("int", str(height)):
                     raise PdfEngineError("原生图像重采样后的像素尺寸不正确")
-            if verification.xref_length() != source_xref_length + len(resampled_masks):
+            if verification.xref_length() != source_xref_length + len(resampled_masks) + len(fills_by_page):
                 raise PdfEngineError("原生图像替换意外新增了 PDF 对象")
 
     return {
@@ -1713,8 +1835,9 @@ def replace_pdf_layers(
         "resampledImagePixels": {
             str(image_xref): {"width": size[0], "height": size[1]}
             for image_xref, size in target_sizes.items()
-            if replacement_mode == "native-images"
+            if direct_mode
         },
+        "recoloredVectorFills": sum(len(fills) for fills in fills_by_page.values()) if direct_mode else 0,
         "stats": stats,
         "unselectedObjectsPreserved": True,
     }
